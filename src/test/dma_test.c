@@ -12,23 +12,31 @@
 **
 ** 文   件   名: dma_test.c
 **
-** 创   建   人: AutoGen
+** 创   建   人: Li.Qifeng
 **
 ** 文件创建日期: 2026 年 03 月 23 日
 **
-** 描        述: AXI DMA 驱动运行时测试套件
+** 描        述: DMA 驱动运行时测试套件（支持 AXI DMA 和 CDMA）
 **               向 tshell 注册以下命令：
-**                 dma_test_simple  — Simple 模式回环测试（MM2S→S2MM）
-**                 dma_test_sg      — SG 模式回环测试
-**                 dma_test_stress  — 重复传输稳定性测试
+**                 dma_test_simple   — AXI DMA Simple 模式回环测试（MM2S→S2MM）
+**                 dma_test_sg       — AXI DMA SG 模式回环测试
+**                 dma_test_stress   — AXI DMA 重复传输稳定性测试
+**                 dma_test_sg_bench — AXI DMA SG 吞吐量基准测试
+**                 dma_test_bench    — AXI DMA 全双工时基基准测试
+**                 dma_test_bench_multi — 多包长全双工基准测试
+**                 dma_test_cdma     — CDMA memcpy 测试
 **
 **               用法（tshell）：
 **                 dma_test_simple  1024       # 传输 1 KiB
 **                 dma_test_sg      256 4      # 4 个 SG 条目，每条 256 字节
 **                 dma_test_stress  512 100    # 重复 100 次 512 字节传输
+**                 dma_test_cdma    512        # CDMA 拷贝 512 字节并校验
 **
-** BUG
+** 修改记录:
 ** 2026.03.23  初始版本。
+** 2026.03.24  对齐 Linux dmaengine API：dmaengine_prep_*、dmaengine_submit（cookie）、
+**             dma_async_issue_pending、dma_async_is_tx_complete、dmaengine_terminate_sync，
+**             删除 dma_adapter 依赖，新增 dma_test_cdma 测试命令。
 *********************************************************************************************************/
 #define __SYLIXOS_KERNEL
 #include <SylixOS.h>
@@ -36,22 +44,23 @@
 #include <string.h>
 #include "drv/dma_types.h"
 #include "drv/dma_client.h"
-#include "drv/dma_core.h"
 
 /*********************************************************************************************************
   配置常量
 *********************************************************************************************************/
 
-#define AXI_DMA_DEV_NAME        "axi_dma0"                             /*  须与 xilinx.c 中一致        */
+#define AXI_DMA_DEV_NAME        "axi_dma0"                             /*  须与 xilinx_dma.c 中一致    */
+#define CDMA_DEV_NAME           "cdma0"
 #define TEST_TIMEOUT_MS         5000u                                   /*  单次传输超时（毫秒）        */
 
 /*********************************************************************************************************
   测试完成上下文
+  cookie 由 dmaengine_submit() 返回，供 dma_async_is_tx_complete() 查询最终状态。
 *********************************************************************************************************/
 
 typedef struct {
     LW_OBJECT_HANDLE  sem;                                              /*  完成信号量                  */
-    int               status;                                           /*  传输结果 DMA_STATUS_*       */
+    dma_cookie_t      cookie;                                           /*  最近一次提交的 cookie       */
 } TEST_CTX;
 
 /*********************************************************************************************************
@@ -59,18 +68,16 @@ typedef struct {
 *********************************************************************************************************/
 /*********************************************************************************************************
 ** 函数名称: _test_cb
-** 功能描述: 传输完成回调（中断上下文）。记录状态并释放信号量唤醒测试任务。
+** 功能描述: 传输完成回调（中断上下文）。释放信号量唤醒测试任务。
 ** 输　入  : arg           TEST_CTX 指针
-**           status        传输结果
 ** 输　出  : NONE
 ** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
-static VOID _test_cb (void *arg, int status)
+static VOID _test_cb (void *arg)
 {
     TEST_CTX *ctx = (TEST_CTX *)arg;
 
-    ctx->status = status;
     API_SemaphoreBPost(ctx->sem);
 }
 /*********************************************************************************************************
@@ -103,7 +110,7 @@ static int _wait_done (TEST_CTX *ctx)
 *********************************************************************************************************/
 static int _ctx_create (TEST_CTX *ctx)
 {
-    ctx->status = DMA_STATUS_IDLE;
+    ctx->cookie = 0;
     ctx->sem    = API_SemaphoreBCreate("dma_test_sem",
                                        LW_FALSE,
                                        LW_OPTION_WAIT_FIFO,
@@ -175,6 +182,7 @@ static INT _cmd_dma_test_simple (INT iArgC, PCHAR ppcArgV[])
     struct dma_chan *rx_chan  = LW_NULL;
     struct dma_desc *tx_desc = LW_NULL;
     struct dma_desc *rx_desc = LW_NULL;
+    struct dma_sg    tx_sg, rx_sg;
     TEST_CTX         tx_ctx, rx_ctx;
     BOOL             tx_ctx_ok = LW_FALSE;
     BOOL             rx_ctx_ok = LW_FALSE;
@@ -202,8 +210,8 @@ static INT _cmd_dma_test_simple (INT iArgC, PCHAR ppcArgV[])
     }
     lib_memset(rx_buf, 0xAA, len);                                      /*  接收缓冲区毒化              */
 
-    tx_chan = dma_request_chan(AXI_DMA_DEV_NAME);
-    rx_chan = dma_request_chan(AXI_DMA_DEV_NAME);
+    tx_chan = dma_request_chan(AXI_DMA_DEV_NAME, DMA_DIR_MM2S);
+    rx_chan = dma_request_chan(AXI_DMA_DEV_NAME, DMA_DIR_S2MM);
     if (!tx_chan || !rx_chan) {
         printk("dma_test_simple: could not get both channels\n");
         ret = -1;
@@ -215,30 +223,37 @@ static INT _cmd_dma_test_simple (INT iArgC, PCHAR ppcArgV[])
     if (_ctx_create(&rx_ctx) != 0) { ret = -1; goto  _done; }
     rx_ctx_ok = LW_TRUE;
 
-    tx_desc = dma_prep_simple(tx_chan, LW_NULL, tx_buf, len, _test_cb, &tx_ctx);
-    rx_desc = dma_prep_simple(rx_chan, rx_buf,  LW_NULL, len, _test_cb, &rx_ctx);
+    tx_sg.buf = tx_buf;  tx_sg.len = len;
+    rx_sg.buf = rx_buf;  rx_sg.len = len;
+
+    tx_desc = dmaengine_prep_slave_sg(tx_chan, &tx_sg, 1, DMA_PREP_INTERRUPT);
+    rx_desc = dmaengine_prep_slave_sg(rx_chan, &rx_sg, 1, DMA_PREP_INTERRUPT);
     if (!tx_desc || !rx_desc) {
         printk("dma_test_simple: prep failed\n");
         ret = -1;
         goto  _done;
     }
 
-    dma_submit(rx_desc);
-    dma_submit(tx_desc);
-    dma_issue_pending(rx_chan);                                         /*  先启动接收，防止数据丢失    */
-    dma_issue_pending(tx_chan);
+    tx_desc->callback       = _test_cb;
+    tx_desc->callback_param = &tx_ctx;
+    rx_desc->callback       = _test_cb;
+    rx_desc->callback_param = &rx_ctx;
+
+    rx_ctx.cookie = dmaengine_submit(rx_desc);
+    tx_ctx.cookie = dmaengine_submit(tx_desc);
+    dma_async_issue_pending(rx_chan);                                    /*  先启动接收，防止数据丢失    */
+    dma_async_issue_pending(tx_chan);
 
     if (_wait_done(&tx_ctx) != 0 || _wait_done(&rx_ctx) != 0) {
-        dma_terminate(tx_chan);
-        dma_terminate(rx_chan);
+        dmaengine_terminate_sync(tx_chan);
+        dmaengine_terminate_sync(rx_chan);
         ret = -1;
         goto  _done;
     }
 
-    if (tx_ctx.status != DMA_STATUS_COMPLETE ||
-        rx_ctx.status != DMA_STATUS_COMPLETE) {
-        printk("dma_test_simple: transfer error (tx=%d rx=%d)\n",
-               tx_ctx.status, rx_ctx.status);
+    if (dma_async_is_tx_complete(tx_chan, tx_ctx.cookie) != DMA_COMPLETE ||
+        dma_async_is_tx_complete(rx_chan, rx_ctx.cookie) != DMA_COMPLETE) {
+        printk("dma_test_simple: transfer error\n");
         ret = -1;
         goto  _done;
     }
@@ -253,8 +268,8 @@ static INT _cmd_dma_test_simple (INT iArgC, PCHAR ppcArgV[])
 _done:
     if (tx_ctx_ok) _ctx_destroy(&tx_ctx);
     if (rx_ctx_ok) _ctx_destroy(&rx_ctx);
-    if (tx_chan)   dma_release_chan(tx_chan);
-    if (rx_chan)   dma_release_chan(rx_chan);
+    if (tx_chan)   dma_release_channel(tx_chan);
+    if (rx_chan)   dma_release_channel(rx_chan);
     if (tx_buf)    API_VmmDmaFree(tx_buf);
     if (rx_buf)    API_VmmDmaFree(rx_buf);
 
@@ -330,8 +345,8 @@ static INT _cmd_dma_test_sg (INT iArgC, PCHAR ppcArgV[])
         rx_sgl[i].len = entry_len;
     }
 
-    tx_chan = dma_request_chan(AXI_DMA_DEV_NAME);
-    rx_chan = dma_request_chan(AXI_DMA_DEV_NAME);
+    tx_chan = dma_request_chan(AXI_DMA_DEV_NAME, DMA_DIR_MM2S);
+    rx_chan = dma_request_chan(AXI_DMA_DEV_NAME, DMA_DIR_S2MM);
     if (!tx_chan || !rx_chan) {
         printk("dma_test_sg: could not get both channels\n");
         ret = -1;
@@ -343,30 +358,34 @@ static INT _cmd_dma_test_sg (INT iArgC, PCHAR ppcArgV[])
     if (_ctx_create(&rx_ctx) != 0) { ret = -1; goto  _done; }
     rx_ctx_ok = LW_TRUE;
 
-    tx_desc = dma_prep_sg(tx_chan, tx_sgl, sg_count, _test_cb, &tx_ctx);
-    rx_desc = dma_prep_sg(rx_chan, rx_sgl, sg_count, _test_cb, &rx_ctx);
+    tx_desc = dmaengine_prep_slave_sg(tx_chan, tx_sgl, sg_count, DMA_PREP_INTERRUPT);
+    rx_desc = dmaengine_prep_slave_sg(rx_chan, rx_sgl, sg_count, DMA_PREP_INTERRUPT);
     if (!tx_desc || !rx_desc) {
         printk("dma_test_sg: prep_sg failed\n");
         ret = -1;
         goto  _done;
     }
 
-    dma_submit(rx_desc);
-    dma_submit(tx_desc);
-    dma_issue_pending(rx_chan);
-    dma_issue_pending(tx_chan);
+    tx_desc->callback       = _test_cb;
+    tx_desc->callback_param = &tx_ctx;
+    rx_desc->callback       = _test_cb;
+    rx_desc->callback_param = &rx_ctx;
+
+    rx_ctx.cookie = dmaengine_submit(rx_desc);
+    tx_ctx.cookie = dmaengine_submit(tx_desc);
+    dma_async_issue_pending(rx_chan);
+    dma_async_issue_pending(tx_chan);
 
     if (_wait_done(&tx_ctx) != 0 || _wait_done(&rx_ctx) != 0) {
-        dma_terminate(tx_chan);
-        dma_terminate(rx_chan);
+        dmaengine_terminate_sync(tx_chan);
+        dmaengine_terminate_sync(rx_chan);
         ret = -1;
         goto  _done;
     }
 
-    if (tx_ctx.status != DMA_STATUS_COMPLETE ||
-        rx_ctx.status != DMA_STATUS_COMPLETE) {
-        printk("dma_test_sg: transfer error (tx=%d rx=%d)\n",
-               tx_ctx.status, rx_ctx.status);
+    if (dma_async_is_tx_complete(tx_chan, tx_ctx.cookie) != DMA_COMPLETE ||
+        dma_async_is_tx_complete(rx_chan, rx_ctx.cookie) != DMA_COMPLETE) {
+        printk("dma_test_sg: transfer error\n");
         ret = -1;
         goto  _done;
     }
@@ -384,8 +403,8 @@ static INT _cmd_dma_test_sg (INT iArgC, PCHAR ppcArgV[])
 _done:
     if (tx_ctx_ok) _ctx_destroy(&tx_ctx);
     if (rx_ctx_ok) _ctx_destroy(&rx_ctx);
-    if (tx_chan)   dma_release_chan(tx_chan);
-    if (rx_chan)   dma_release_chan(rx_chan);
+    if (tx_chan)   dma_release_channel(tx_chan);
+    if (rx_chan)   dma_release_channel(rx_chan);
     if (tx_bufs) {
         for (i = 0; i < sg_count; i++) {
             if (tx_bufs[i]) API_VmmDmaFree(tx_bufs[i]);
@@ -438,8 +457,8 @@ static INT _cmd_dma_test_stress (INT iArgC, PCHAR ppcArgV[])
         goto  _done;
     }
 
-    tx_chan = dma_request_chan(AXI_DMA_DEV_NAME);
-    rx_chan = dma_request_chan(AXI_DMA_DEV_NAME);
+    tx_chan = dma_request_chan(AXI_DMA_DEV_NAME, DMA_DIR_MM2S);
+    rx_chan = dma_request_chan(AXI_DMA_DEV_NAME, DMA_DIR_S2MM);
     if (!tx_chan || !rx_chan) {
         printk("dma_test_stress: could not get channels\n");
         goto  _done;
@@ -453,6 +472,7 @@ static INT _cmd_dma_test_stress (INT iArgC, PCHAR ppcArgV[])
     for (i = 0; i < count; i++) {
         struct dma_desc *tx_desc;
         struct dma_desc *rx_desc;
+        struct dma_sg    tx_sg, rx_sg;
         size_t           k;
 
         for (k = 0; k < len; k++) {                                     /*  每轮重新填充图样            */
@@ -462,32 +482,46 @@ static INT _cmd_dma_test_stress (INT iArgC, PCHAR ppcArgV[])
 
         API_SemaphoreBClear(tx_ctx.sem);
         API_SemaphoreBClear(rx_ctx.sem);
-        tx_ctx.status = DMA_STATUS_IDLE;
-        rx_ctx.status = DMA_STATUS_IDLE;
 
-        tx_desc = dma_prep_simple(tx_chan, LW_NULL, tx_buf, len, _test_cb, &tx_ctx);
-        rx_desc = dma_prep_simple(rx_chan, rx_buf,  LW_NULL, len, _test_cb, &rx_ctx);
+        tx_sg.buf = tx_buf;  tx_sg.len = len;
+        rx_sg.buf = rx_buf;  rx_sg.len = len;
+
+        tx_desc = dmaengine_prep_slave_sg(tx_chan, &tx_sg, 1, DMA_PREP_INTERRUPT);
+        rx_desc = dmaengine_prep_slave_sg(rx_chan, &rx_sg, 1, DMA_PREP_INTERRUPT);
         if (!tx_desc || !rx_desc) {
             fail++;
-            if (tx_desc) { dma_submit(tx_desc); dma_terminate(tx_chan); }
-            if (rx_desc) { dma_submit(rx_desc); dma_terminate(rx_chan); }
+            if (tx_desc) {
+                tx_desc->callback = LW_NULL;
+                dmaengine_submit(tx_desc);
+                dmaengine_terminate_sync(tx_chan);
+            }
+            if (rx_desc) {
+                rx_desc->callback = LW_NULL;
+                dmaengine_submit(rx_desc);
+                dmaengine_terminate_sync(rx_chan);
+            }
             continue;
         }
 
-        dma_submit(rx_desc);
-        dma_submit(tx_desc);
-        dma_issue_pending(rx_chan);
-        dma_issue_pending(tx_chan);
+        tx_desc->callback       = _test_cb;
+        tx_desc->callback_param = &tx_ctx;
+        rx_desc->callback       = _test_cb;
+        rx_desc->callback_param = &rx_ctx;
+
+        rx_ctx.cookie = dmaengine_submit(rx_desc);
+        tx_ctx.cookie = dmaengine_submit(tx_desc);
+        dma_async_issue_pending(rx_chan);
+        dma_async_issue_pending(tx_chan);
 
         if (_wait_done(&tx_ctx) != 0 || _wait_done(&rx_ctx) != 0) {
-            dma_terminate(tx_chan);
-            dma_terminate(rx_chan);
+            dmaengine_terminate_sync(tx_chan);
+            dmaengine_terminate_sync(rx_chan);
             fail++;
             continue;
         }
 
-        if (tx_ctx.status == DMA_STATUS_COMPLETE &&
-            rx_ctx.status == DMA_STATUS_COMPLETE &&
+        if (dma_async_is_tx_complete(tx_chan, tx_ctx.cookie) == DMA_COMPLETE &&
+            dma_async_is_tx_complete(rx_chan, rx_ctx.cookie) == DMA_COMPLETE &&
             _verify_buf(tx_buf, rx_buf, len) == 0) {
             pass++;
         } else {
@@ -501,8 +535,8 @@ static INT _cmd_dma_test_stress (INT iArgC, PCHAR ppcArgV[])
 _done:
     if (tx_ctx_ok) _ctx_destroy(&tx_ctx);
     if (rx_ctx_ok) _ctx_destroy(&rx_ctx);
-    if (tx_chan)   dma_release_chan(tx_chan);
-    if (rx_chan)   dma_release_chan(rx_chan);
+    if (tx_chan)   dma_release_channel(tx_chan);
+    if (rx_chan)   dma_release_channel(rx_chan);
     if (tx_buf)    API_VmmDmaFree(tx_buf);
     if (rx_buf)    API_VmmDmaFree(rx_buf);
 
@@ -587,8 +621,8 @@ static INT _cmd_dma_test_sg_bench (INT iArgC, PCHAR ppcArgV[])
         rx_sgl[i].len = entry_len;
     }
 
-    tx_chan = dma_request_chan(AXI_DMA_DEV_NAME);
-    rx_chan = dma_request_chan(AXI_DMA_DEV_NAME);
+    tx_chan = dma_request_chan(AXI_DMA_DEV_NAME, DMA_DIR_MM2S);
+    rx_chan = dma_request_chan(AXI_DMA_DEV_NAME, DMA_DIR_S2MM);
     if (!tx_chan || !rx_chan) {
         printk("dma_test_sg_bench: could not get both channels\n");
         ret = -1;
@@ -609,51 +643,51 @@ static INT _cmd_dma_test_sg_bench (INT iArgC, PCHAR ppcArgV[])
     for (i = 0; i < count; i++) {
         struct dma_desc *tx_desc;
         struct dma_desc *rx_desc;
-        int              k;
         int              ok = 1;
-
-        // for (k = 0; k < sg_count; k++) {                               /*  每轮重置接收缓冲区          */
-        //     lib_memset(rx_bufs[k], 0, entry_len);
-        // }
 
         API_SemaphoreBClear(tx_ctx.sem);
         API_SemaphoreBClear(rx_ctx.sem);
-        tx_ctx.status = DMA_STATUS_IDLE;
-        rx_ctx.status = DMA_STATUS_IDLE;
 
-        tx_desc = dma_prep_sg(tx_chan, tx_sgl, sg_count, _test_cb, &tx_ctx);
-        rx_desc = dma_prep_sg(rx_chan, rx_sgl, sg_count, _test_cb, &rx_ctx);
+        tx_desc = dmaengine_prep_slave_sg(tx_chan, tx_sgl, sg_count, DMA_PREP_INTERRUPT);
+        rx_desc = dmaengine_prep_slave_sg(rx_chan, rx_sgl, sg_count, DMA_PREP_INTERRUPT);
         if (!tx_desc || !rx_desc) {
-            if (tx_desc) { dma_submit(tx_desc); dma_terminate(tx_chan); }
-            if (rx_desc) { dma_submit(rx_desc); dma_terminate(rx_chan); }
+            if (tx_desc) {
+                tx_desc->callback = LW_NULL;
+                dmaengine_submit(tx_desc);
+                dmaengine_terminate_sync(tx_chan);
+            }
+            if (rx_desc) {
+                rx_desc->callback = LW_NULL;
+                dmaengine_submit(rx_desc);
+                dmaengine_terminate_sync(rx_chan);
+            }
             fail++;
             continue;
         }
 
-        dma_submit(rx_desc);
-        dma_submit(tx_desc);
-        dma_issue_pending(rx_chan);
-        dma_issue_pending(tx_chan);
+        tx_desc->callback       = _test_cb;
+        tx_desc->callback_param = &tx_ctx;
+        rx_desc->callback       = _test_cb;
+        rx_desc->callback_param = &rx_ctx;
+
+        rx_ctx.cookie = dmaengine_submit(rx_desc);
+        tx_ctx.cookie = dmaengine_submit(tx_desc);
+        dma_async_issue_pending(rx_chan);
+        dma_async_issue_pending(tx_chan);
 
         if (_wait_done(&tx_ctx) != 0 || _wait_done(&rx_ctx) != 0) {
-            dma_terminate(tx_chan);
-            dma_terminate(rx_chan);
+            dmaengine_terminate_sync(tx_chan);
+            dmaengine_terminate_sync(rx_chan);
             fail++;
             continue;
         }
 
-        if (tx_ctx.status != DMA_STATUS_COMPLETE ||
-            rx_ctx.status != DMA_STATUS_COMPLETE) {
+        if (dma_async_is_tx_complete(tx_chan, tx_ctx.cookie) != DMA_COMPLETE ||
+            dma_async_is_tx_complete(rx_chan, rx_ctx.cookie) != DMA_COMPLETE) {
             fail++;
             continue;
         }
 
-        // for (k = 0; k < sg_count && ok; k++) {                         /*  逐条目数据校验              */
-        //     if (_verify_buf(tx_bufs[k], rx_bufs[k], entry_len) != 0) {
-        //         printk("dma_test_sg_bench: data mismatch at itr %d entry %d\n", i, k);
-        //         ok = 0;
-        //     }
-        // }
         if (ok) {
             pass++;
         } else {
@@ -684,8 +718,8 @@ static INT _cmd_dma_test_sg_bench (INT iArgC, PCHAR ppcArgV[])
 _done:
     if (tx_ctx_ok) _ctx_destroy(&tx_ctx);
     if (rx_ctx_ok) _ctx_destroy(&rx_ctx);
-    if (tx_chan)   dma_release_chan(tx_chan);
-    if (rx_chan)   dma_release_chan(rx_chan);
+    if (tx_chan)   dma_release_channel(tx_chan);
+    if (rx_chan)   dma_release_channel(rx_chan);
     if (tx_bufs) {
         for (i = 0; i < sg_count; i++) {
             if (tx_bufs[i]) API_VmmDmaFree(tx_bufs[i]);
@@ -864,10 +898,9 @@ static PVOID _bench_tx_thread (PVOID pvArg)
         }
 
         API_SemaphoreBClear(ctrl->tx_ctx.sem);
-        ctrl->tx_ctx.status = DMA_STATUS_IDLE;
 
-        tx_desc = dma_prep_sg(ctrl->tx_chan, ctrl->tx_sgl, ctrl->sg_count,
-                              _test_cb, &ctrl->tx_ctx);
+        tx_desc = dmaengine_prep_slave_sg(ctrl->tx_chan, ctrl->tx_sgl,
+                                          ctrl->sg_count, DMA_PREP_INTERRUPT);
         if (!tx_desc) {
             LW_SPIN_LOCK_QUICK(&ctrl->lock, &ireg);
             ctrl->stats.tx_errors++;
@@ -875,21 +908,23 @@ static PVOID _bench_tx_thread (PVOID pvArg)
             /*  TX prep 失败：对应的 S2MM 已 issue，回环无数据会挂死；
              *  终止双向通道，结束本次测试。                              */
             ctrl->stop = 1;
-            dma_terminate(ctrl->rx_chan);
+            dmaengine_terminate_sync(ctrl->rx_chan);
             break;
         }
-        dma_submit(tx_desc);
-        dma_issue_pending(ctrl->tx_chan);
+        tx_desc->callback       = _test_cb;
+        tx_desc->callback_param = &ctrl->tx_ctx;
+        ctrl->tx_ctx.cookie     = dmaengine_submit(tx_desc);
+        dma_async_issue_pending(ctrl->tx_chan);
 
         if (_wait_done(&ctrl->tx_ctx) != 0) {                          /*  非中断等待，避免 in-flight  */
-            dma_terminate(ctrl->tx_chan);
+            dmaengine_terminate_sync(ctrl->tx_chan);
             LW_SPIN_LOCK_QUICK(&ctrl->lock, &ireg);
             ctrl->stats.tx_errors++;
             LW_SPIN_UNLOCK_QUICK(&ctrl->lock, ireg);
             break;
         }
 
-        if (ctrl->tx_ctx.status == DMA_STATUS_COMPLETE) {
+        if (dma_async_is_tx_complete(ctrl->tx_chan, ctrl->tx_ctx.cookie) == DMA_COMPLETE) {
             LW_SPIN_LOCK_QUICK(&ctrl->lock, &ireg);
             ctrl->stats.tx_packets++;
             ctrl->stats.tx_bytes += (unsigned long long)pkt_bytes;
@@ -927,10 +962,9 @@ static PVOID _bench_rx_thread (PVOID pvArg)
         }
 
         API_SemaphoreBClear(ctrl->rx_ctx.sem);
-        ctrl->rx_ctx.status = DMA_STATUS_IDLE;
 
-        rx_desc = dma_prep_sg(ctrl->rx_chan, ctrl->rx_sgl, ctrl->sg_count,
-                              _test_cb, &ctrl->rx_ctx);
+        rx_desc = dmaengine_prep_slave_sg(ctrl->rx_chan, ctrl->rx_sgl,
+                                          ctrl->sg_count, DMA_PREP_INTERRUPT);
         if (!rx_desc) {
             LW_SPIN_LOCK_QUICK(&ctrl->lock, &ireg);
             ctrl->stats.rx_errors++;
@@ -938,20 +972,22 @@ static PVOID _bench_rx_thread (PVOID pvArg)
             ctrl->stop = 1;                                             /*  资源耗尽，终止测试          */
             break;
         }
-        dma_submit(rx_desc);
-        dma_issue_pending(ctrl->rx_chan);
+        rx_desc->callback       = _test_cb;
+        rx_desc->callback_param = &ctrl->rx_ctx;
+        ctrl->rx_ctx.cookie     = dmaengine_submit(rx_desc);
+        dma_async_issue_pending(ctrl->rx_chan);
 
         API_SemaphoreBPost(ctrl->rx_armed_sem);                        /*  通知 TX 线程 S2MM 已就绪    */
 
         if (_wait_done(&ctrl->rx_ctx) != 0) {                          /*  非中断等待，避免 in-flight  */
-            dma_terminate(ctrl->rx_chan);
+            dmaengine_terminate_sync(ctrl->rx_chan);
             LW_SPIN_LOCK_QUICK(&ctrl->lock, &ireg);
             ctrl->stats.rx_errors++;
             LW_SPIN_UNLOCK_QUICK(&ctrl->lock, ireg);
             break;
         }
 
-        if (ctrl->rx_ctx.status != DMA_STATUS_COMPLETE) {
+        if (dma_async_is_tx_complete(ctrl->rx_chan, ctrl->rx_ctx.cookie) != DMA_COMPLETE) {
             LW_SPIN_LOCK_QUICK(&ctrl->lock, &ireg);
             ctrl->stats.rx_errors++;
             LW_SPIN_UNLOCK_QUICK(&ctrl->lock, ireg);
@@ -1118,8 +1154,8 @@ static int _bench_run_one (size_t entry_len, int sg_count, int duration_sec)
         ctrl->rx_sgl[i].len = entry_len;
     }
 
-    ctrl->tx_chan = dma_request_chan(AXI_DMA_DEV_NAME);
-    ctrl->rx_chan = dma_request_chan(AXI_DMA_DEV_NAME);
+    ctrl->tx_chan = dma_request_chan(AXI_DMA_DEV_NAME, DMA_DIR_MM2S);
+    ctrl->rx_chan = dma_request_chan(AXI_DMA_DEV_NAME, DMA_DIR_S2MM);
     if (!ctrl->tx_chan || !ctrl->rx_chan) {
         printk("dma_test_bench: could not get DMA channels\n");
         ret = -1;
@@ -1196,8 +1232,8 @@ _cleanup:
     if (ctrl->rx_armed_ok) API_SemaphoreBDelete(&ctrl->rx_armed_sem);
     if (ctrl->rx_ctx_ok)   _ctx_destroy(&ctrl->rx_ctx);
     if (ctrl->tx_ctx_ok)   _ctx_destroy(&ctrl->tx_ctx);
-    if (ctrl->rx_chan)      dma_release_chan(ctrl->rx_chan);
-    if (ctrl->tx_chan)      dma_release_chan(ctrl->tx_chan);
+    if (ctrl->rx_chan)      dma_release_channel(ctrl->rx_chan);
+    if (ctrl->tx_chan)      dma_release_channel(ctrl->tx_chan);
     for (i = 0; i < sg_count; i++) {
         if (ctrl->tx_bufs[i]) API_VmmDmaFree(ctrl->tx_bufs[i]);
         if (ctrl->rx_bufs[i]) API_VmmDmaFree(ctrl->rx_bufs[i]);
@@ -1217,6 +1253,7 @@ static const struct {
     { "Eth-512B",   512,   1 },                                         /*  中等以太网帧                */
     { "Eth-1518B",  1518,  1 },                                         /*  以太网 MTU 最大帧           */
     { "Blk-4KB",    1024,  4 },                                         /*  块设备 4 KiB（4×1K SG）    */
+    { "custom-32KB",   4096,  1 },                                      /*  定制配置（1×4K SG）        */
     { "Blk-32KB",   4096,  8 },                                         /*  块设备 32 KiB（8×4K SG）   */
 };
 
@@ -1280,9 +1317,106 @@ static INT _cmd_dma_test_bench_multi (INT iArgC, PCHAR ppcArgV[])
 
     return  0;
 }
+/*********************************************************************************************************
+** 函数名称: _cmd_dma_test_cdma
+** 功能描述: CDMA memcpy 测试命令。
+**           分配两块 DMA zone 缓冲区，通过 CDMA 将源缓冲区内容拷贝到目标缓冲区并校验。
+**           须在 xilinx_dma.c 中启用 ENABLE_CDMA 宏方可运行。
+** 输　入  : iArgC         参数数量
+**           ppcArgV       ppcArgV[1]=拷贝字节数（可选，默认 512）
+** 输　出  : 0 PASS；-1 FAIL
+** 全局变量:
+** 调用模块:
+                                           API 函数
+*********************************************************************************************************/
+static INT _cmd_dma_test_cdma (INT iArgC, PCHAR ppcArgV[])
+{
+    size_t          len    = 512;
+    UINT8          *src    = LW_NULL;
+    UINT8          *dst    = LW_NULL;
+    struct dma_chan *chan   = LW_NULL;
+    struct dma_desc *desc  = LW_NULL;
+    TEST_CTX         ctx;
+    BOOL             ctx_ok = LW_FALSE;
+    size_t           i;
+    int              ret   = 0;
+
+    if (iArgC >= 2) {
+        len = (size_t)lib_strtoul(ppcArgV[1], LW_NULL, 10);
+        if (!len) {
+            printk("dma_test_cdma: invalid length\n");
+            return  (-1);
+        }
+    }
+
+    src = (UINT8 *)API_VmmDmaAlloc(len);
+    dst = (UINT8 *)API_VmmDmaAlloc(len);
+    if (!src || !dst) {
+        printk("dma_test_cdma: DMA alloc failed\n");
+        ret = -1;
+        goto  _done;
+    }
+
+    for (i = 0; i < len; i++) {
+        src[i] = (UINT8)(i & 0xFF);
+    }
+    lib_memset(dst, 0xAA, len);
+
+    chan = dma_request_chan(CDMA_DEV_NAME, DMA_DIR_MEM2MEM);
+    if (!chan) {
+        printk("dma_test_cdma: cdma0 not available (ENABLE_CDMA not set?)\n");
+        ret = -1;
+        goto  _done;
+    }
+
+    if (_ctx_create(&ctx) != 0) {
+        ret = -1;
+        goto  _done;
+    }
+    ctx_ok = LW_TRUE;
+
+    desc = dmaengine_prep_dma_memcpy(chan, dst, src, len, DMA_PREP_INTERRUPT);
+    if (!desc) {
+        printk("dma_test_cdma: prep_memcpy failed\n");
+        ret = -1;
+        goto  _done;
+    }
+
+    desc->callback       = _test_cb;
+    desc->callback_param = &ctx;
+    ctx.cookie           = dmaengine_submit(desc);
+    dma_async_issue_pending(chan);
+
+    if (_wait_done(&ctx) != 0) {
+        dmaengine_terminate_sync(chan);
+        ret = -1;
+        goto  _done;
+    }
+
+    if (dma_async_is_tx_complete(chan, ctx.cookie) != DMA_COMPLETE) {
+        printk("dma_test_cdma: transfer error\n");
+        ret = -1;
+        goto  _done;
+    }
+
+    ret = _verify_buf(src, dst, len);
+    if (ret == 0) {
+        printk("dma_test_cdma: PASS (len=%u)\n", (UINT)len);
+    } else {
+        printk("dma_test_cdma: FAIL (data mismatch)\n");
+    }
+
+_done:
+    if (ctx_ok) _ctx_destroy(&ctx);
+    if (chan)   dma_release_channel(chan);
+    if (src)    API_VmmDmaFree(src);
+    if (dst)    API_VmmDmaFree(dst);
+
+    return  (ret);
+}
 
 /*********************************************************************************************************
-  命令注册（原始）
+  命令注册
 *********************************************************************************************************/
 /*********************************************************************************************************
 ** 函数名称: dma_test_register_cmds
@@ -1336,6 +1470,12 @@ void dma_test_register_cmds (void)
                          "Run dma_test_bench across multiple packet sizes\n"
                          "  seconds   - test duration per size (default 10)\n"
                          "  Sizes: Eth-64B, Eth-512B, Eth-1518B, Blk-4KB, Blk-32KB\n");
+
+    API_TShellKeywordAdd("dma_test_cdma",  _cmd_dma_test_cdma);
+    API_TShellFormatAdd ("dma_test_cdma",  " [<length>]");
+    API_TShellHelpAdd   ("dma_test_cdma",
+                         "Run a CDMA memcpy test (requires ENABLE_CDMA in xilinx_dma.c)\n"
+                         "  length - copy size in bytes (default 512)\n");
 }
 /*********************************************************************************************************
   END

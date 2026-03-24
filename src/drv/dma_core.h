@@ -12,13 +12,18 @@
 **
 ** 文   件   名: dma_core.h
 **
-** 创   建   人: AutoGen
+** 创   建   人: Li.Qifeng
 **
 ** 文件创建日期: 2026 年 03 月 23 日
 **
 ** 描        述: DMA 引擎核心层公共接口
 **               提供设备注册/注销、通道管理、描述符生命周期及调度接口。
-**               类比 Linux DMA Engine core，但针对 RTOS 精简实现。
+**               本层不依赖任何具体硬件，由控制器驱动（hw/xilinx/）和客户端层共同调用。
+**
+** 修改记录:
+** 2026.03.24  增加 dma_core_alloc_chan_dir（方向筛选）；dma_core_complete
+**             改用 enum dma_status 并更新 completed_cookie/last_status。
+**
 *********************************************************************************************************/
 
 #ifndef DMA_CORE_H_
@@ -27,62 +32,60 @@
 #include "dma_types.h"
 
 /*********************************************************************************************************
-  模块初始化 / 退出（须在 module_init / module_exit 中各调用一次）
+  模块初始化 / 退出
 *********************************************************************************************************/
 
 int  dma_core_init(void);
 void dma_core_exit(void);
 
 /*********************************************************************************************************
-  设备注册 / 注销（由控制器驱动调用，如 axi_dma_probe / axi_dma_remove）
+  设备注册 / 注销（由控制器驱动 probe / remove 调用）
 *********************************************************************************************************/
 
-int  dma_device_register(struct dma_device *dev);
-void dma_device_unregister(struct dma_device *dev);
-
-/*
- * 按名称查找已注册设备，找不到返回 NULL
- */
-struct dma_device *dma_find_device(const char *name);
+int                dma_device_register  (struct dma_device *dev);
+void               dma_device_unregister(struct dma_device *dev);
+struct dma_device *dma_find_device      (const char *name);
 
 /*********************************************************************************************************
   通道管理
+  dma_core_alloc_chan_dir : 按方向分配第一个空闲通道；direction=DMA_DIR_ANY 不过滤方向。
+  dma_core_free_chan      : 排空队列（错误回调），标记通道空闲。
 *********************************************************************************************************/
 
-struct dma_chan *dma_core_alloc_chan(struct dma_device *dev);
-void            dma_core_free_chan(struct dma_chan *chan);
+struct dma_chan *dma_core_alloc_chan_dir(struct dma_device *dev, int direction);
+void            dma_core_free_chan     (struct dma_chan *chan);
 
 /*********************************************************************************************************
   描述符生命周期
-  dma_desc_alloc：分配并初始化一个空描述符，绑定到指定通道。
-  dma_desc_free ：释放描述符及其 hw_desc 硬件资源。
-                  须在完成回调返回后（desc->status 为 COMPLETE/ERROR）才可调用。
+  dma_desc_alloc : 由 device_prep_* 在硬件驱动内部调用，分配并初始化空描述符。
+  dma_desc_free  : 调用 desc->free_hw_desc() 释放 hw_desc，再释放 desc 本体。
+                   核心层在 dma_core_complete / dma_core_handle_error 中自动调用。
 *********************************************************************************************************/
 
 struct dma_desc *dma_desc_alloc(struct dma_chan *chan);
-void             dma_desc_free(struct dma_desc *desc);
+void             dma_desc_free (struct dma_desc *desc);
 
 /*********************************************************************************************************
-  调度接口
-  dma_core_submit       ：将描述符加入 pending 队列。
-  dma_core_issue_pending：触发调度器，若通道空闲则启动第一个 pending 描述符。
-  dma_core_schedule     ：内部调度函数，将 pending → active，调用 ops->issue_pending。
+  提交与调度（内部接口，由 dma_client.c 通过 dmaengine_submit 调用）
+  dma_core_submit        : 将 desc 加入 pending 队列，cookie 已由 dmaengine_submit() 赋值。
+  dma_core_issue_pending : 若 active 为空，将 pending 头描述符移至 active 并调用 issue_pending。
+  dma_core_schedule      : 同 dma_core_issue_pending，可在 ISR 底半部安全调用。
 *********************************************************************************************************/
 
-int  dma_core_submit(struct dma_desc *desc);
+int  dma_core_submit       (struct dma_desc *desc);
 void dma_core_issue_pending(struct dma_chan *chan);
-void dma_core_schedule(struct dma_chan *chan);
+void dma_core_schedule     (struct dma_chan *chan);
 
 /*********************************************************************************************************
-  完成处理 — 由硬件 ISR 在传输完成后调用。
-  更新描述符状态、调用完成回调、释放描述符，并调度下一个 pending 描述符。
-  注意：本函数在中断上下文中执行，回调必须轻量级（禁止阻塞）。
+  完成处理（由硬件 ISR 底半部调用）
+  更新 completed_cookie / last_status，释放描述符，调度下一个，触发回调。
+  在 defer 线程中执行，回调可以使用 SylixOS 同步原语（信号量等），但禁止无限阻塞。
 *********************************************************************************************************/
 
-void dma_core_complete(struct dma_chan *chan, struct dma_desc *desc, int status);
+void dma_core_complete(struct dma_chan *chan, struct dma_desc *desc, enum dma_status status);
 
 /*********************************************************************************************************
-  错误恢复 — 停止通道，排空队列（对所有描述符调用错误回调）
+  错误恢复（停止通道，排空所有队列，对每个描述符以 DMA_ERROR 触发回调）
 *********************************************************************************************************/
 
 void dma_core_handle_error(struct dma_chan *chan);

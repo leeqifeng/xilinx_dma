@@ -12,36 +12,36 @@
 **
 ** 文   件   名: dma_client.c
 **
-** 创   建   人: AutoGen
+** 创   建   人: Li.Qifeng
 **
 ** 文件创建日期: 2026 年 03 月 23 日
 **
-** 描        述: DMA 客户端 API 实现
-**               面向设备驱动和应用程序的顶层接口。每个函数完成以下工作：
-**               1. 通过核心层定位通道/设备
-**               2. 分配描述符并通过适配层填充硬件信息
-**               3. 将提交和调度请求转发至核心层
-**               本文件不直接操作任何硬件寄存器。
+** 描        述: DMA 引擎客户端 API 实现（对标 Linux dmaengine 客户端接口）
+**               不直接操作任何硬件寄存器。参数校验在本层完成（原适配层职责合并）。
 **
-** BUG
-** 2026.03.23  初始版本。
+** 修改记录:
+** 2026.03.24  对齐 Linux dmaengine：接口重命名，引入 cookie，删除 dma_adapter 依赖，
+**             参数校验直接在本层执行，增加 MCDMA 专用通道申请接口。
+**
 *********************************************************************************************************/
 #define __SYLIXOS_KERNEL
 #include <SylixOS.h>
+#include <stdlib.h>
 #include "dma_types.h"
 #include "dma_client.h"
 #include "dma_core.h"
-#include "dma_adapter.h"
 
 /*********************************************************************************************************
 ** 函数名称: dma_request_chan
-** 功能描述: 按设备名称查找控制器，在其上分配第一个空闲通道并初始化硬件。
-** 输　入  : name          设备名称（须与 axi_dma_probe 中 dev->name 一致）
+** 功能描述: 按名称和方向申请通道。
+**           找到设备并调用 device_alloc_chan_resources 初始化硬件通道。
+** 输　入  : name          设备名（与 probe 时 dev->name 一致）
+**           direction     DMA_DIR_* 或 DMA_DIR_ANY
 ** 输　出  : 成功返回通道指针；失败返回 NULL
 ** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
-struct dma_chan *dma_request_chan (const char *name)
+struct dma_chan *dma_request_chan (const char *name, int direction)
 {
     struct dma_device *dev;
     struct dma_chan   *chan;
@@ -56,14 +56,14 @@ struct dma_chan *dma_request_chan (const char *name)
         return  (LW_NULL);
     }
 
-    chan = dma_core_alloc_chan(dev);
+    chan = dma_core_alloc_chan_dir(dev, direction);
     if (!chan) {
-        printk("dma_client: no free channel on '%s'\n", name);
+        printk("dma_client: no free channel (dir=%d) on '%s'\n", direction, name);
         return  (LW_NULL);
     }
 
-    if (chan->dev->ops && chan->dev->ops->chan_init) {                   /*  通道硬件初始化              */
-        if (chan->dev->ops->chan_init(chan) != 0) {
+    if (chan->dev->ops && chan->dev->ops->device_alloc_chan_resources) {
+        if (chan->dev->ops->device_alloc_chan_resources(chan) != 0) {
             dma_core_free_chan(chan);
             return  (LW_NULL);
         }
@@ -72,173 +72,279 @@ struct dma_chan *dma_request_chan (const char *name)
     return  (chan);
 }
 /*********************************************************************************************************
-** 函数名称: dma_release_chan
-** 功能描述: 终止所有在途传输（发出错误回调），归还通道到空闲池
-** 输　入  : chan          待释放的通道指针
+** 函数名称: dma_request_mcdma_chan
+** 功能描述: MCDMA 专用通道申请：按名称、方向和 TDEST 精确申请。
+**           通道的 priv->tdest 由 mcdma_probe 预设，本函数匹配对应通道。
+** 输　入  : name          设备名
+**           direction     DMA_DIR_MM2S 或 DMA_DIR_S2MM
+**           tdest         目标 TDEST（0 ~ 31）
+** 输　出  : 成功返回通道指针；失败返回 NULL
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+struct dma_chan *dma_request_mcdma_chan (const char *name, int direction, int tdest)
+{
+    struct dma_device *dev;
+    struct dma_chan   *chan;
+    int                i;
+    INTREG             ireg;
+
+    if (!name) {
+        return  (LW_NULL);
+    }
+
+    dev = dma_find_device(name);
+    if (!dev || dev->ip_type != DMA_IP_MCDMA) {
+        printk("dma_client: MCDMA device '%s' not found\n", name);
+        return  (LW_NULL);
+    }
+
+    for (i = 0; i < dev->num_channels; i++) {
+        chan = &dev->channels[i];
+
+        LW_SPIN_LOCK_QUICK(&chan->lock, &ireg);
+        if (!chan->in_use && chan->direction == direction) {
+            /*  检查 priv->tdest（XDMA_CHAN 结构体偏移 0 为 tdest，见 xilinx_dma.h）  */
+            int *p_tdest = (int *)chan->priv;                           /*  XDMA_CHAN 首字段为 tdest    */
+            if (p_tdest && *p_tdest == tdest) {
+                chan->in_use          = LW_TRUE;
+                chan->pending_q       = LW_NULL;
+                chan->active_q        = LW_NULL;
+                chan->cookie          = DMA_MIN_COOKIE;
+                chan->completed_cookie = 0;
+                chan->last_status     = DMA_COMPLETE;
+                LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
+
+                if (chan->dev->ops && chan->dev->ops->device_alloc_chan_resources) {
+                    if (chan->dev->ops->device_alloc_chan_resources(chan) != 0) {
+                        chan->in_use = LW_FALSE;
+                        return  (LW_NULL);
+                    }
+                }
+                return  (chan);
+            }
+        }
+        LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
+    }
+
+    printk("dma_client: MCDMA channel (dir=%d tdest=%d) not found on '%s'\n",
+           direction, tdest, name);
+    return  (LW_NULL);
+}
+/*********************************************************************************************************
+** 函数名称: dma_release_channel
+** 功能描述: 释放通道：终止所有传输（触发 DMA_ERROR 回调），归还通道到空闲池。
+** 输　入  : chan          DMA 通道指针
 ** 输　出  : NONE
 ** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
-void dma_release_chan (struct dma_chan *chan)
+void dma_release_channel (struct dma_chan *chan)
 {
     if (!chan) {
         return;
     }
 
+    if (chan->dev->ops && chan->dev->ops->device_free_chan_resources) {
+        chan->dev->ops->device_free_chan_resources(chan);
+    }
+
     dma_core_free_chan(chan);
 }
+
 /*********************************************************************************************************
-** 函数名称: dma_prep_simple
-** 功能描述: 为单段连续缓冲区传输准备描述符。
-**           完成回调在中断上下文触发，必须轻量（如仅释放信号量），禁止阻塞。
-**           回调触发后描述符由核心层自动释放，调用方不得继续使用返回的指针。
-** 输　入  : chan          目标通道指针
-**           dst           目标虚拟地址（S2MM 有效，MM2S 可传 NULL）
-**           src           源虚拟地址（MM2S 有效，S2MM 可传 NULL）
-**           len           传输字节数
-**           cb            完成回调函数
-**           arg           传递给回调的用户参数
-** 输　出  : 成功返回描述符指针；失败返回 NULL
+  传输准备
+*********************************************************************************************************/
+/*********************************************************************************************************
+** 函数名称: dmaengine_prep_slave_sg
+** 功能描述: 流式 SG 传输准备（AXI DMA / MCDMA）。
+**           nents=1 等价于单缓冲区简单模式。
+**           调用方在返回的 desc 上设置 callback / callback_param，再调用 dmaengine_submit()。
+** 输　入  : chan          目标通道
+**           sgl           SG 列表（虚拟地址）
+**           nents         条目数（≥1）
+**           flags         DMA_PREP_INTERRUPT 等
+** 输　出  : 成功返回 dma_desc 指针；失败返回 NULL
 ** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
-struct dma_desc *dma_prep_simple (struct dma_chan *chan,
-                                  void *dst, void *src, size_t len,
-                                  dma_complete_cb_t cb, void *arg)
+struct dma_desc *dmaengine_prep_slave_sg (struct dma_chan *chan,
+                                          struct dma_sg *sgl, int nents,
+                                          unsigned long flags)
 {
-    struct dma_desc *desc;
+    int i;
 
-    if (!chan || !len) {
+    if (!chan || !sgl || nents <= 0) {
         return  (LW_NULL);
     }
 
-    desc = dma_desc_alloc(chan);
-    if (!desc) {
+    for (i = 0; i < nents; i++) {                                      /*  参数校验（原适配层职责）    */
+        if (!sgl[i].buf || !sgl[i].len) {
+            printk("dma_client: prep_slave_sg invalid SG entry [%d]\n", i);
+            return  (LW_NULL);
+        }
+    }
+
+    if (!chan->dev || !chan->dev->ops || !chan->dev->ops->device_prep_slave_sg) {
+        printk("dma_client: device_prep_slave_sg not implemented\n");
         return  (LW_NULL);
     }
 
-    desc->cb     = cb;
-    desc->cb_arg = arg;
-
-    if (dma_adapter_prep_simple(desc, dst, src, len) != 0) {
-        dma_desc_free(desc);
-        return  (LW_NULL);
-    }
-
-    return  (desc);
+    return  chan->dev->ops->device_prep_slave_sg(chan, sgl, nents, flags);
 }
 /*********************************************************************************************************
-** 函数名称: dma_prep_sg
-** 功能描述: 为分散聚集传输准备描述符。
-**           sgl[].buf 须指向 DMA 一致性内存（DMA zone）或已 Cache flush 的内存；
-**           sgl[].len 须大于 0。
-** 输　入  : chan          目标通道指针
-**           sgl           分散聚集列表（虚拟地址）
-**           sg_len        列表条目数
-**           cb            完成回调函数
-**           arg           传递给回调的用户参数
-** 输　出  : 成功返回描述符指针；失败返回 NULL
+** 函数名称: dmaengine_prep_dma_memcpy
+** 功能描述: 内存到内存拷贝准备（CDMA 专用）。
+** 输　入  : chan          目标 CDMA 通道（direction == DMA_DIR_MEM2MEM）
+**           dst / src     目标/源虚拟地址
+**           len           字节数
+**           flags         DMA_PREP_INTERRUPT 等
+** 输　出  : 成功返回 dma_desc 指针；失败返回 NULL
 ** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
-struct dma_desc *dma_prep_sg (struct dma_chan *chan,
-                               struct dma_sg *sgl, int sg_len,
-                               dma_complete_cb_t cb, void *arg)
+struct dma_desc *dmaengine_prep_dma_memcpy (struct dma_chan *chan,
+                                            void *dst, const void *src, size_t len,
+                                            unsigned long flags)
 {
-    struct dma_desc *desc;
-
-    if (!chan || !sgl || sg_len <= 0) {
+    if (!chan || !dst || !src || !len) {
         return  (LW_NULL);
     }
 
-    desc = dma_desc_alloc(chan);
-    if (!desc) {
+    if (!chan->dev || !chan->dev->ops || !chan->dev->ops->device_prep_dma_memcpy) {
+        printk("dma_client: device_prep_dma_memcpy not implemented\n");
         return  (LW_NULL);
     }
 
-    desc->cb     = cb;
-    desc->cb_arg = arg;
-
-    if (dma_adapter_prep_sg(desc, sgl, sg_len) != 0) {
-        dma_desc_free(desc);
-        return  (LW_NULL);
-    }
-
-    return  (desc);
+    return  chan->dev->ops->device_prep_dma_memcpy(chan, dst, (void *)src, len, flags);
 }
 /*********************************************************************************************************
-** 函数名称: dma_submit
-** 功能描述: 将已准备好的描述符加入 pending 队列。
-**           传输不会立即启动，须后续调用 dma_issue_pending()。
-** 输　入  : desc          已通过 dma_prep_* 准备的描述符指针
-** 输　出  : 0 成功；-1 失败
+** 函数名称: dmaengine_prep_interleaved_dma
+** 功能描述: 2D 帧传输准备（VDMA 专用）。
+** 输　入  : chan          目标 VDMA 通道
+**           cfg           2D 传输配置（vsize/hsize/stride/帧地址等）
+**           flags         DMA_PREP_INTERRUPT 等
+** 输　出  : 成功返回 dma_desc 指针；失败返回 NULL
 ** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
-int dma_submit (struct dma_desc *desc)
+struct dma_desc *dmaengine_prep_interleaved_dma (struct dma_chan *chan,
+                                                  const struct dma_vdma_config *cfg,
+                                                  unsigned long flags)
 {
+    if (!chan || !cfg || !cfg->vsize || !cfg->hsize || cfg->frm_cnt <= 0) {
+        return  (LW_NULL);
+    }
+
+    if (!chan->dev || !chan->dev->ops || !chan->dev->ops->device_prep_interleaved_dma) {
+        printk("dma_client: device_prep_interleaved_dma not implemented\n");
+        return  (LW_NULL);
+    }
+
+    return  chan->dev->ops->device_prep_interleaved_dma(chan, cfg, flags);
+}
+
+/*********************************************************************************************************
+  提交与触发
+*********************************************************************************************************/
+/*********************************************************************************************************
+** 函数名称: dmaengine_submit
+** 功能描述: 为描述符分配 cookie 并加入 pending 队列，返回 cookie 供状态查询。
+**           传输不会立即启动，须后续调用 dma_async_issue_pending()。
+** 输　入  : desc          已由 dmaengine_prep_* 准备的描述符
+** 输　出  : ≥1 有效 cookie；≤0 表示失败
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+dma_cookie_t dmaengine_submit (struct dma_desc *desc)
+{
+    struct dma_chan *chan;
+    dma_cookie_t    cookie;
+    INTREG          ireg;
+
     if (!desc || !desc->chan) {
         return  (-1);
     }
+    chan = desc->chan;
 
-    return  dma_core_submit(desc);
+    LW_SPIN_LOCK_QUICK(&chan->lock, &ireg);
+    cookie = chan->cookie;
+    if (++chan->cookie < DMA_MIN_COOKIE) {                              /*  防止溢出回绕到 0            */
+        chan->cookie = DMA_MIN_COOKIE;
+    }
+    desc->cookie = cookie;
+    LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
+
+    dma_core_submit(desc);
+
+    return  (cookie);
 }
 /*********************************************************************************************************
-** 函数名称: dma_issue_pending
-** 功能描述: 启动通道上第一个 pending 描述符的硬件传输。
-**           后续描述符在前一个完成中断中自动调度，无需再次调用本函数。
-** 输　入  : chan          目标通道指针
-** 输　出  : 0 成功；-1 参数无效
+** 函数名称: dma_async_issue_pending
+** 功能描述: 触发通道上第一个 pending 传输。后续传输在前一个完成时自动调度。
+** 输　入  : chan          DMA 通道指针
+** 输　出  : NONE
 ** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
-int dma_issue_pending (struct dma_chan *chan)
+void dma_async_issue_pending (struct dma_chan *chan)
 {
     if (!chan) {
-        return  (-1);
+        return;
     }
 
     dma_core_issue_pending(chan);
-
-    return  (0);
 }
+
 /*********************************************************************************************************
-** 函数名称: dma_tx_status
-** 功能描述: 轮询查询描述符当前传输状态。
-**           若控制器驱动提供了 tx_status ops，则通过硬件寄存器判断；
-**           否则直接返回 desc->status。
-**           仅在回调触发前（传输仍在进行时）调用有意义。
+  状态查询与控制
+*********************************************************************************************************/
+/*********************************************************************************************************
+** 函数名称: dma_async_is_tx_complete
+** 功能描述: 查询 cookie 对应传输的状态。
+**           cookie <= completed_cookie：返回 last_status（COMPLETE 或 ERROR）；
+**           否则返回 DMA_IN_PROGRESS。
+**           若 ops->device_tx_status 存在，则通过硬件寄存器获取更精确状态。
 ** 输　入  : chan          通道指针
-**           desc          待查询的描述符指针（NULL 则返回 DMA_STATUS_IDLE）
-** 输　出  : DMA_STATUS_* 状态码
+**           cookie        dmaengine_submit() 返回的 cookie
+** 输　出  : DMA_COMPLETE / DMA_IN_PROGRESS / DMA_ERROR
 ** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
-int dma_tx_status (struct dma_chan *chan, struct dma_desc *desc)
+enum dma_status dma_async_is_tx_complete (struct dma_chan *chan, dma_cookie_t cookie)
 {
-    struct dma_ops *ops;
+    INTREG          ireg;
+    dma_cookie_t    completed;
+    enum dma_status last;
 
-    if (!desc) {
-        return  (DMA_STATUS_IDLE);
+    if (!chan || cookie <= 0) {
+        return  (DMA_ERROR);
     }
 
-    ops = (chan && chan->dev) ? chan->dev->ops : LW_NULL;
-    if (ops && ops->tx_status) {
-        return  ops->tx_status(chan, desc);
+    if (chan->dev && chan->dev->ops && chan->dev->ops->device_tx_status) {
+        return  chan->dev->ops->device_tx_status(chan, cookie);
     }
 
-    return  (desc->status);
+    LW_SPIN_LOCK_QUICK(&chan->lock, &ireg);
+    completed = chan->completed_cookie;
+    last      = chan->last_status;
+    LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
+
+    if (cookie <= completed) {
+        return  (last);
+    }
+
+    return  (DMA_IN_PROGRESS);
 }
 /*********************************************************************************************************
-** 函数名称: dma_terminate
-** 功能描述: 立即停止通道，终止所有 pending/active 传输，
-**           对每个在途描述符以 DMA_STATUS_ERROR 调用回调后释放资源。
-** 输　入  : chan          目标通道指针
+** 函数名称: dmaengine_terminate_sync
+** 功能描述: 立即停止通道，排空所有 pending/active 传输，对每个触发回调后释放资源。
+** 输　入  : chan          DMA 通道指针
 ** 输　出  : 0 成功；-1 参数无效
 ** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
-int dma_terminate (struct dma_chan *chan)
+int dmaengine_terminate_sync (struct dma_chan *chan)
 {
     if (!chan) {
         return  (-1);

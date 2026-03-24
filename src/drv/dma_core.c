@@ -12,21 +12,23 @@
 **
 ** 文   件   名: dma_core.c
 **
-** 创   建   人: AutoGen
+** 创   建   人: Li.Qifeng
 **
 ** 文件创建日期: 2026 年 03 月 23 日
 **
-** 描        述: DMA 引擎核心层
-**               实现全局设备链表、通道/描述符生命周期管理、pending→active 调度、
-**               完成处理及错误恢复。
+** 描        述: DMA 引擎核心层实现
+**               全局设备链表、通道/描述符生命周期管理、pending→active 调度、
+**               完成处理（cookie 更新）及错误恢复。
 **
 **               线程安全模型：
-**               - 全局设备链表由 _G_core_lock（spinlock）保护。
-**               - 每个 dma_chan 有独立的 lock，使用 LW_SPIN_LOCK_QUICK（保存并关中断），
-**                 任务上下文和 ISR 上下文均可安全访问队列。
+**               - 全局设备链表由 _G_core_lock 保护。
+**               - 每个 dma_chan 有独立 lock（IRQ 安全），保护队列和 cookie 字段。
 **
-** BUG
-** 2026.03.23  初始版本。
+** 修改记录:
+** 2026.03.24  新增 dma_core_alloc_chan_dir（方向筛选）；
+**             dma_core_complete 改用 enum dma_status 并维护 completed_cookie/last_status；
+**             callback 签名改为 (void *param)，对齐 Linux dma_async_tx_callback。
+**
 *********************************************************************************************************/
 #define __SYLIXOS_KERNEL
 #include <SylixOS.h>
@@ -38,23 +40,14 @@
   全局变量
 *********************************************************************************************************/
 
-static PLW_LIST_LINE  _G_dev_list   = LW_NULL;                         /*  已注册设备链表头            */
-static spinlock_t     _G_core_lock;                                     /*  设备链表保护锁              */
-static BOOL           _G_core_inited = LW_FALSE;                        /*  核心是否已初始化            */
+static PLW_LIST_LINE  _G_dev_list    = LW_NULL;
+static spinlock_t     _G_core_lock;
+static BOOL           _G_core_inited = LW_FALSE;
 
 /*********************************************************************************************************
-  队列辅助内联函数（双向链表，基于 LW_LIST_LINE）
-  避免依赖 SylixOS 内核私有的 _List_Line_Add/Del 符号。
+  队列辅助函数（双向链表，基于 LW_LIST_LINE）
 *********************************************************************************************************/
-/*********************************************************************************************************
-** 函数名称: _q_add_tail
-** 功能描述: 将节点追加到链表尾部
-** 输　入  : head          链表头指针的指针
-**           node          待插入节点
-** 输　出  : NONE
-** 全局变量:
-** 调用模块:
-*********************************************************************************************************/
+
 static LW_INLINE VOID _q_add_tail (PLW_LIST_LINE *head, PLW_LIST_LINE node)
 {
     PLW_LIST_LINE iter;
@@ -62,33 +55,25 @@ static LW_INLINE VOID _q_add_tail (PLW_LIST_LINE *head, PLW_LIST_LINE node)
     node->LINE_plistNext = LW_NULL;
     node->LINE_plistPrev = LW_NULL;
 
-    if (*head == LW_NULL) {                                             /*  链表为空，直接成为头节点    */
+    if (*head == LW_NULL) {
         *head = node;
         return;
     }
 
     iter = *head;
-    while (iter->LINE_plistNext) {                                      /*  找到尾节点                  */
+    while (iter->LINE_plistNext) {
         iter = iter->LINE_plistNext;
     }
     iter->LINE_plistNext = node;
     node->LINE_plistPrev = iter;
 }
-/*********************************************************************************************************
-** 函数名称: _q_del
-** 功能描述: 从链表中删除指定节点
-** 输　入  : head          链表头指针的指针
-**           node          待删除节点
-** 输　出  : NONE
-** 全局变量:
-** 调用模块:
-*********************************************************************************************************/
+
 static LW_INLINE VOID _q_del (PLW_LIST_LINE *head, PLW_LIST_LINE node)
 {
-    if (node->LINE_plistPrev) {                                         /*  非头节点                    */
+    if (node->LINE_plistPrev) {
         node->LINE_plistPrev->LINE_plistNext = node->LINE_plistNext;
     } else {
-        *head = node->LINE_plistNext;                                   /*  头节点，更新头指针          */
+        *head = node->LINE_plistNext;
     }
 
     if (node->LINE_plistNext) {
@@ -104,11 +89,10 @@ static LW_INLINE VOID _q_del (PLW_LIST_LINE *head, PLW_LIST_LINE node)
 *********************************************************************************************************/
 /*********************************************************************************************************
 ** 函数名称: dma_core_init
-** 功能描述: 初始化 DMA 引擎核心：初始化全局 spinlock，重置设备链表。
-**           须在 module_init() 中最先调用，且只调用一次。
+** 功能描述: 初始化 DMA 引擎核心，只调用一次。
 ** 输　入  : NONE
 ** 输　出  : 0（始终成功）
-** 全局变量: _G_core_lock, _G_dev_list, _G_core_inited
+** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
 int dma_core_init (void)
@@ -125,11 +109,10 @@ int dma_core_init (void)
 }
 /*********************************************************************************************************
 ** 函数名称: dma_core_exit
-** 功能描述: 退出 DMA 引擎核心。
-**           调用前须确保所有设备已通过 dma_device_unregister() 注销。
+** 功能描述: 退出核心层（须先注销所有设备）。
 ** 输　入  : NONE
 ** 输　出  : NONE
-** 全局变量: _G_core_inited
+** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
 void dma_core_exit (void)
@@ -138,15 +121,14 @@ void dma_core_exit (void)
 }
 
 /*********************************************************************************************************
-  设备注册 / 注销
+  设备注册 / 注销 / 查找
 *********************************************************************************************************/
 /*********************************************************************************************************
 ** 函数名称: dma_device_register
-** 功能描述: 将控制器设备加入全局设备链表，使其可被 dma_find_device() 找到。
-**           通常由控制器驱动的 probe 函数调用。
-** 输　入  : dev           dma_device 指针（name、ops 等字段须已填充）
+** 功能描述: 将控制器设备加入全局链表。
+** 输　入  : dev           DMA 设备指针
 ** 输　出  : 0 成功；-1 参数无效
-** 全局变量: _G_dev_list, _G_core_lock
+** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
 int dma_device_register (struct dma_device *dev)
@@ -167,11 +149,10 @@ int dma_device_register (struct dma_device *dev)
 }
 /*********************************************************************************************************
 ** 函数名称: dma_device_unregister
-** 功能描述: 将控制器设备从全局设备链表移除。
-**           通常由控制器驱动的 remove 函数调用。
-** 输　入  : dev           dma_device 指针
+** 功能描述: 将控制器设备从全局链表移除。
+** 输　入  : dev           DMA 设备指针
 ** 输　出  : NONE
-** 全局变量: _G_dev_list, _G_core_lock
+** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
 void dma_device_unregister (struct dma_device *dev)
@@ -188,10 +169,10 @@ void dma_device_unregister (struct dma_device *dev)
 }
 /*********************************************************************************************************
 ** 函数名称: dma_find_device
-** 功能描述: 按名称查找已注册的 DMA 控制器设备
+** 功能描述: 按名称查找已注册设备。
 ** 输　入  : name          设备名称字符串
 ** 输　出  : 找到时返回 dma_device 指针；未找到返回 NULL
-** 全局变量: _G_dev_list, _G_core_lock
+** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
 struct dma_device *dma_find_device (const char *name)
@@ -223,14 +204,16 @@ struct dma_device *dma_find_device (const char *name)
   通道管理
 *********************************************************************************************************/
 /*********************************************************************************************************
-** 函数名称: dma_core_alloc_chan
-** 功能描述: 在指定设备上寻找第一个空闲通道并标记为已占用。
-** 输　入  : dev           目标设备指针
+** 函数名称: dma_core_alloc_chan_dir
+** 功能描述: 按方向分配第一个空闲通道。
+**           direction == DMA_DIR_ANY 时不过滤方向，分配首个空闲通道。
+** 输　入  : dev           目标设备
+**           direction     DMA_DIR_* 或 DMA_DIR_ANY
 ** 输　出  : 成功返回通道指针；无空闲通道返回 NULL
 ** 全局变量:
 ** 调用模块:
 *********************************************************************************************************/
-struct dma_chan *dma_core_alloc_chan (struct dma_device *dev)
+struct dma_chan *dma_core_alloc_chan_dir (struct dma_device *dev, int direction)
 {
     struct dma_chan *chan;
     INTREG           ireg;
@@ -244,10 +227,14 @@ struct dma_chan *dma_core_alloc_chan (struct dma_device *dev)
         chan = &dev->channels[i];
 
         LW_SPIN_LOCK_QUICK(&chan->lock, &ireg);
-        if (!chan->in_use) {
-            chan->in_use    = LW_TRUE;
-            chan->pending_q = LW_NULL;
-            chan->active_q  = LW_NULL;
+        if (!chan->in_use &&
+            (direction == DMA_DIR_ANY || chan->direction == direction)) {
+            chan->in_use          = LW_TRUE;
+            chan->pending_q       = LW_NULL;
+            chan->active_q        = LW_NULL;
+            chan->cookie          = DMA_MIN_COOKIE;
+            chan->completed_cookie = 0;
+            chan->last_status     = DMA_COMPLETE;
             LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
             return  (chan);
         }
@@ -258,8 +245,8 @@ struct dma_chan *dma_core_alloc_chan (struct dma_device *dev)
 }
 /*********************************************************************************************************
 ** 函数名称: dma_core_free_chan
-** 功能描述: 释放通道：先排空队列（发出错误回调），再标记为空闲。
-** 输　入  : chan          待释放的通道指针
+** 功能描述: 排空队列（错误回调），标记通道空闲。
+** 输　入  : chan          DMA 通道指针
 ** 输　出  : NONE
 ** 全局变量:
 ** 调用模块:
@@ -270,7 +257,7 @@ void dma_core_free_chan (struct dma_chan *chan)
         return;
     }
 
-    dma_core_handle_error(chan);                                        /*  排空队列                    */
+    dma_core_handle_error(chan);
     chan->in_use = LW_FALSE;
 }
 
@@ -279,9 +266,8 @@ void dma_core_free_chan (struct dma_chan *chan)
 *********************************************************************************************************/
 /*********************************************************************************************************
 ** 函数名称: dma_desc_alloc
-** 功能描述: 分配并初始化一个空描述符，绑定到指定通道。
-**           hw_desc 由 ops->prep_simple / ops->prep_sg 在后续填充。
-** 输　入  : chan          目标通道指针
+** 功能描述: 分配并初始化空描述符，绑定通道。由 device_prep_* 内部调用。
+** 输　入  : chan          DMA 通道指针
 ** 输　出  : 成功返回描述符指针；失败返回 NULL
 ** 全局变量:
 ** 调用模块:
@@ -301,16 +287,15 @@ struct dma_desc *dma_desc_alloc (struct dma_chan *chan)
 
     lib_memset(desc, 0, sizeof(struct dma_desc));
     desc->chan   = chan;
-    desc->status = DMA_STATUS_IDLE;
+    desc->status = DMA_IN_PROGRESS;
 
     return  (desc);
 }
 /*********************************************************************************************************
 ** 函数名称: dma_desc_free
-** 功能描述: 释放描述符及其关联的硬件资源（hw_desc）。
-**           通过 ops->desc_free 回调将硬件资源清理委托给控制器驱动。
-**           须在完成回调返回后（desc 不在任何队列中）才可调用。
-** 输　入  : desc          待释放的描述符指针
+** 功能描述: 释放描述符及其 hw_desc。
+**           调用 desc->free_hw_desc()（HW 层设置）释放硬件资源，再 free desc 本体。
+** 输　入  : desc          DMA 描述符指针
 ** 输　出  : NONE
 ** 全局变量:
 ** 调用模块:
@@ -321,12 +306,11 @@ void dma_desc_free (struct dma_desc *desc)
         return;
     }
 
-    if (desc->chan && desc->chan->dev &&
-        desc->chan->dev->ops && desc->chan->dev->ops->desc_free) {
-        desc->chan->dev->ops->desc_free(desc);                          /*  委托硬件层清理 hw_desc      */
+    if (desc->free_hw_desc) {
+        desc->free_hw_desc(desc);                                       /*  HW 层释放 bd_virt 等资源    */
     }
 
-    free(desc);
+    lib_free(desc);
 }
 
 /*********************************************************************************************************
@@ -334,9 +318,8 @@ void dma_desc_free (struct dma_desc *desc)
 *********************************************************************************************************/
 /*********************************************************************************************************
 ** 函数名称: dma_core_submit
-** 功能描述: 将准备好的描述符加入通道的 pending 队列。
-**           调用后须通过 dma_core_issue_pending() 触发调度才会实际启动硬件。
-** 输　入  : desc          已由 ops->prep_* 填充的描述符指针
+** 功能描述: 将描述符（cookie 已赋值）加入 pending 队列。
+** 输　入  : desc          已准备好的 DMA 描述符
 ** 输　出  : 0 成功；-1 参数无效
 ** 全局变量:
 ** 调用模块:
@@ -351,8 +334,6 @@ int dma_core_submit (struct dma_desc *desc)
     }
     chan = desc->chan;
 
-    desc->status = DMA_STATUS_PENDING;
-
     LW_SPIN_LOCK_QUICK(&chan->lock, &ireg);
     _q_add_tail(&chan->pending_q, &desc->node);
     LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
@@ -361,11 +342,9 @@ int dma_core_submit (struct dma_desc *desc)
 }
 /*********************************************************************************************************
 ** 函数名称: dma_core_schedule
-** 功能描述: 内部调度函数。
-**           若 active_q 为空且 pending_q 非空，则将 pending_q 首描述符移至 active_q，
-**           调用 ops->issue_pending() 启动硬件传输。
-**           可在任务上下文和 ISR 上下文中安全调用。
-** 输　入  : chan          目标通道指针
+** 功能描述: 若 active_q 为空且 pending_q 非空，将首个 pending 描述符移至 active 并触发传输。
+**           可在任务上下文和底半部安全调用。
+** 输　入  : chan          DMA 通道指针
 ** 输　出  : NONE
 ** 全局变量:
 ** 调用模块:
@@ -381,26 +360,26 @@ void dma_core_schedule (struct dma_chan *chan)
 
     LW_SPIN_LOCK_QUICK(&chan->lock, &ireg);
 
-    if (chan->active_q != LW_NULL || chan->pending_q == LW_NULL) {      /*  active 非空或无 pending     */
+    if (chan->active_q != LW_NULL || chan->pending_q == LW_NULL) {
         LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
         return;
     }
 
-    desc = _LIST_ENTRY(chan->pending_q, struct dma_desc, node);         /*  取 pending 队头             */
+    desc = _LIST_ENTRY(chan->pending_q, struct dma_desc, node);
     _q_del(&chan->pending_q, &desc->node);
-    _q_add_tail(&chan->active_q, &desc->node);                          /*  移入 active 队列            */
-    desc->status = DMA_STATUS_ACTIVE;
+    _q_add_tail(&chan->active_q, &desc->node);
+    desc->status = DMA_IN_PROGRESS;
 
     LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
 
-    if (chan->dev->ops->issue_pending) {
-        chan->dev->ops->issue_pending(chan);                             /*  启动硬件（仅寄存器写，安全）*/
+    if (chan->dev->ops->device_issue_pending) {
+        chan->dev->ops->device_issue_pending(chan);
     }
 }
 /*********************************************************************************************************
 ** 函数名称: dma_core_issue_pending
-** 功能描述: 对外的调度触发接口，内部委托给 dma_core_schedule()
-** 输　入  : chan          目标通道指针
+** 功能描述: 对外调度触发接口，委托给 dma_core_schedule()。
+** 输　入  : chan          DMA 通道指针
 ** 输　出  : NONE
 ** 全局变量:
 ** 调用模块:
@@ -409,51 +388,59 @@ void dma_core_issue_pending (struct dma_chan *chan)
 {
     dma_core_schedule(chan);
 }
+
+/*********************************************************************************************************
+  完成处理
+*********************************************************************************************************/
 /*********************************************************************************************************
 ** 函数名称: dma_core_complete
-** 功能描述: 传输完成处理函数，由硬件 ISR 调用。
-**           将描述符从 active_q 移除，更新状态，调用完成回调，
-**           释放描述符资源，然后调度下一个 pending 描述符。
-**           警告：在中断上下文执行，回调必须轻量级（如 API_SemaphoreBPost），禁止阻塞。
+** 功能描述: 传输完成处理（由硬件驱动底半部调用）。
+**           更新 completed_cookie / last_status，移出队列，释放描述符，
+**           调度下一个 pending，最后触发完成回调。
 ** 输　入  : chan          通道指针
-**           desc          已完成的描述符指针
-**           status        传输结果 DMA_STATUS_COMPLETE 或 DMA_STATUS_ERROR
+**           desc          已完成的描述符
+**           status        DMA_COMPLETE 或 DMA_ERROR
 ** 输　出  : NONE
 ** 全局变量:
 ** 调用模块:
+** 注意    : 在 defer 线程中执行；回调可使用 API_SemaphoreBPost 等轻量原语。
 *********************************************************************************************************/
-void dma_core_complete (struct dma_chan *chan, struct dma_desc *desc, int status)
+void dma_core_complete (struct dma_chan *chan, struct dma_desc *desc, enum dma_status status)
 {
-    dma_complete_cb_t  cb;
-    void              *cb_arg;
-    INTREG             ireg;
+    dma_async_tx_callback  cb;
+    void                  *cb_param;
+    INTREG                 ireg;
 
     if (!chan || !desc) {
         return;
     }
 
-    cb     = desc->cb;
-    cb_arg = desc->cb_arg;
+    cb       = desc->callback;
+    cb_param = desc->callback_param;
 
     LW_SPIN_LOCK_QUICK(&chan->lock, &ireg);
-    _q_del(&chan->active_q, &desc->node);                               /*  移出 active 队列            */
-    desc->status = status;
+    _q_del(&chan->active_q, &desc->node);
+    desc->status           = status;
+    chan->completed_cookie = desc->cookie;                              /*  更新 cookie，供状态查询     */
+    chan->last_status      = status;
     LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
 
-    dma_desc_free(desc);                                                /*  先释放资源，再唤醒用户线程  */
-                                                                        /*  防止用户线程与 desc_free    */
-                                                                        /*  并发访问 DMA zone 分配器    */
-    dma_core_schedule(chan);                                            /*  调度下一个 pending 描述符   */
+    dma_desc_free(desc);                                                /*  释放 hw_desc + desc 本体    */
+    dma_core_schedule(chan);                                            /*  调度下一个 pending          */
 
     if (cb) {
-        cb(cb_arg, status);                                             /*  最后唤醒用户线程（ISR 安全）*/
+        cb(cb_param);                                                   /*  唤醒等待线程（最后执行）    */
     }
 }
+
+/*********************************************************************************************************
+  错误恢复
+*********************************************************************************************************/
 /*********************************************************************************************************
 ** 函数名称: dma_core_handle_error
-** 功能描述: 错误恢复：停止通道，逐一排空 active_q 和 pending_q，
-**           对每个描述符调用 DMA_STATUS_ERROR 回调后释放资源。
-** 输　入  : chan          目标通道指针
+** 功能描述: 停止通道，排空 active_q 和 pending_q，
+**           对每个描述符以 DMA_ERROR 触发回调后释放资源。
+** 输　入  : chan          DMA 通道指针
 ** 输　出  : NONE
 ** 全局变量:
 ** 调用模块:
@@ -467,11 +454,11 @@ void dma_core_handle_error (struct dma_chan *chan)
         return;
     }
 
-    if (chan->dev->ops && chan->dev->ops->chan_stop) {
-        chan->dev->ops->chan_stop(chan);                                 /*  停止硬件通道                */
+    if (chan->dev->ops && chan->dev->ops->device_terminate_all) {
+        chan->dev->ops->device_terminate_all(chan);
     }
 
-    for (;;) {                                                          /*  排空 active 队列            */
+    for (;;) {
         LW_SPIN_LOCK_QUICK(&chan->lock, &ireg);
         if (chan->active_q == LW_NULL) {
             LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
@@ -481,11 +468,11 @@ void dma_core_handle_error (struct dma_chan *chan)
         _q_del(&chan->active_q, &desc->node);
         LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
 
-        if (desc->cb) desc->cb(desc->cb_arg, DMA_STATUS_ERROR);
+        if (desc->callback) desc->callback(desc->callback_param);
         dma_desc_free(desc);
     }
 
-    for (;;) {                                                          /*  排空 pending 队列           */
+    for (;;) {
         LW_SPIN_LOCK_QUICK(&chan->lock, &ireg);
         if (chan->pending_q == LW_NULL) {
             LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
@@ -495,7 +482,7 @@ void dma_core_handle_error (struct dma_chan *chan)
         _q_del(&chan->pending_q, &desc->node);
         LW_SPIN_UNLOCK_QUICK(&chan->lock, ireg);
 
-        if (desc->cb) desc->cb(desc->cb_arg, DMA_STATUS_ERROR);
+        if (desc->callback) desc->callback(desc->callback_param);
         dma_desc_free(desc);
     }
 }
