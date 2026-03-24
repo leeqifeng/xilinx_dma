@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="GB2312" standalone="no"?>
+<SylixOSSetting>
+    <BaseSetting Profile="standard" ProjectType="SylixOSKoProject" RealEvoVer="6.5.0 Ultimate" TlsVersion="SylixOS_COM_LTS_3.6.5"/>
+    <OutputSetting>
+        <OutputPath Name="Output" Path="Release:Debug" TreeNode="Output"/>
+        <OutputPath Name="Debug" Path="Debug" TreeNode="Debug"/>
+        <OutputPath Name="Release" Path="Release" TreeNode="Release"/>
+    </OutputSetting>
+    <BuildSetting CoustomCfgMakefile="false" NeedReBuild="false" NotScanSourceFile="false"/>
+    <DeviceSetting DevName="10.4.0.79" WorkDir="/lib/modules/xilinx_dma"/>
+    <UploadPath>
+        <PairItem key="$(WORKSPACE_xilinx_dma)/$(Output)/strip/xilinx_dma.ko" value="/lib/modules/xilinx_dma.ko"/>
+    </UploadPath>
+</SylixOSSetting>
