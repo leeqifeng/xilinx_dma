@@ -144,7 +144,54 @@ static LW_INLINE VOID  write32_raw (UINT32  uiData, addr_t  ulAddr)
   write IOMEM
 *********************************************************************************************************/
 #define write32(d, a)       write32_raw(d, a)
+/*********************************************************************************************************
+  THREAD
+*********************************************************************************************************/
+LW_API  
+LW_CLASS_THREADATTR     API_ThreadAttrGetDefault(VOID);                 /*  获得默认线程属性块          */
 
+LW_API  
+LW_CLASS_THREADATTR     API_ThreadAttrGet(LW_OBJECT_HANDLE  ulId);      /*  获得指定线程当前属性块      */
+
+LW_API ULONG            API_ThreadAttrBuild(PLW_CLASS_THREADATTR    pthreadattr,
+                                            size_t                  stStackByteSize, 
+                                            UINT8                   ucPriority, 
+                                            ULONG                   ulOption, 
+                                            PVOID                   pvArg);
+                                                                        /*  生成一个线程属性块          */
+                                            
+LW_API ULONG            API_ThreadAttrBuildEx(PLW_CLASS_THREADATTR    pthreadattr,
+                                              PLW_STACK               pstkStackTop, 
+                                              size_t                  stStackByteSize, 
+                                              UINT8                   ucPriority, 
+                                              ULONG                   ulOption, 
+                                              PVOID                   pvArg,
+                                              PVOID                   pvExt);
+                                                                        /*  生成一个高级线程属性块      */
+
+                                                                        
+LW_API LW_OBJECT_HANDLE API_ThreadInit(CPCHAR                   pcName,
+                                       PTHREAD_START_ROUTINE    pfuncThread,
+                                       PLW_CLASS_THREADATTR     pthreadattr,
+                                       LW_OBJECT_ID            *pulId); /*  线程初始化                  */
+                                       
+LW_API LW_OBJECT_HANDLE API_ThreadCreate(CPCHAR                   pcName,
+                                         PTHREAD_START_ROUTINE    pfuncThread,
+                                         PLW_CLASS_THREADATTR     pthreadattr,
+                                         LW_OBJECT_ID            *pulId);
+                                                                        /*  建立一个线程                */
+
+LW_API ULONG            API_ThreadDelete(LW_OBJECT_HANDLE  *pulId, 
+                                         PVOID  pvRetVal);              /*  删除一个线程                */
+                                         
+LW_API ULONG            API_ThreadStart(LW_OBJECT_HANDLE    ulId);      /*  启动一个已经初始化的线程    */
+
+LW_API ULONG            API_ThreadStartEx(LW_OBJECT_HANDLE  ulId, 
+                                          BOOL              bJoin, 
+                                          PVOID            *ppvRetValAddr);
+
+LW_API ULONG            API_ThreadJoin(LW_OBJECT_HANDLE  ulId, 
+                                       PVOID  *ppvRetValAddr);          /*  线程合并                    */                                         
 /*********************************************************************************************************
   BINARY SEMAPHORE
 *********************************************************************************************************/
