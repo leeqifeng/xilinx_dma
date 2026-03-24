@@ -1876,8 +1876,12 @@ static int xilinx_dma_chan_probe (XDMA_DEVICE *xdev, struct dma_device *dev,
     }
 
     _xdma_init_core_chan(cc, dev, hw, chan_idx);
+    {
+        #define IRQ_TYPE_LEVEL_HIGH             (0x00000004)
+        extern VOID  bspIntVectorTypeSet(ULONG  ulVector, INT  iType);
+        bspIntVectorTypeSet(irq, IRQ_TYPE_LEVEL_HIGH);
+    }
 
-    bspIntVectorTypeSet(irq, IRQ_TYPE_LEVEL_HIGH);
     API_InterVectorConnect(irq, xdev->dma_config->irq_handler, (PVOID)hw,
                            xdev->dma_config->irq_name);
     API_InterVectorEnable(irq);
