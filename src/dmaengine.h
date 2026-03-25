@@ -171,7 +171,7 @@ typedef struct dma_chan {
     struct dma_device                  *device;                         /*  所属 DMA 控制器             */
     dma_cookie_t                        cookie;                         /*  最后提交的 cookie           */
     dma_cookie_t                        completed_cookie;               /*  最后完成的 cookie           */
-    CHAR                                chan_name[32];                  /*  通道名称（如 "fream-dma-ch0"）*/
+    CHAR                                chan_name[32];                  /*  通道名称（如 "demoip-dma-ch0"）*/
     LW_LIST_LINE                        node;                           /*  设备通道链表节点            */
     PVOID                               private;                        /*  驱动私有扩展指针            */
 } dma_chan_t;

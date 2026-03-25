@@ -17,12 +17,13 @@ src/
 ├── dma.c                   内核模块入口（module_init / module_exit）
 ├── dmaengine.h             框架核心头文件（数据结构 + 公开 API + inline helpers）
 ├── dmaengine.c             框架核心实现（全局设备链表管理、通道调度、状态查询）
+├── os_common.h             操作系统提供的接口示例，因代码量过大，这里只是一部分接口示例（实际工程中包含sylixos.h，不存在os_common.h）
 ├── hw/
-│   └── fream/
+│   └── demoip/
 │       ├── demoip.h        Demo IP 驱动公开头文件
 │       └── demoip.c        Demo IP 纯软件模拟 DMA 驱动（memcpy + Slave SG，移植参考模板）
 └── test/
-    └── dma_test.c          tshell 测试套件（6 个命令：memcpy / multi / sg / loopback / loopback_fd / perf）
+    └── dma_test.c          tshell 测试套件（5 个命令，含 BER 误码率统计）
 ```
 
 ---
@@ -80,7 +81,7 @@ dma_device_t                                dma_chan_t
 ```text
 使用者
   │
-  ├─ dma_request_chan_by_name("fream-dma", 0)
+  ├─ dma_request_chan_by_name("demoip-dma", 0)
   │     └─ 遍历 _G_dma_device_list → 匹配 dev_name + idx
   │         └─ device_alloc_chan_resources(chan)  ← 驱动：初始化 worker 线程 + 信号量
   │
@@ -163,11 +164,11 @@ dma_device_t                                dma_chan_t
 
 ## 6. Demo IP 驱动说明
 
-`hw/fream/demoip.c` 为纯软件模拟 DMA 控制器，无真实硬件依赖：
+`hw/demoip/demoip.c` 为纯软件模拟 DMA 控制器，无真实硬件依赖：
 
 | 属性             | 值                                                |
 |------------------|---------------------------------------------------|
-| 设备名           | `"fream-dma"`                                     |
+| 设备名           | `"demoip-dma"`                                     |
 | 通道数           | 2（`ch0` / `ch1`，各有独立 worker 线程）          |
 | 支持能力         | `DMA_MEMCPY` + `DMA_SLAVE`（Scatter-Gather）      |
 | MEMCPY 实现      | `lib_memcpy`（worker 线程中执行）                 |
@@ -178,7 +179,54 @@ dma_device_t                                dma_chan_t
 | worker 栈大小    | 8192 字节                                         |
 | 描述符内存       | `sys_malloc / sys_free`（驱动管理，含 sgl 副本）  |
 
-### 私有描述符结构
+### 6.1 板级静态参数与 probe 模式
+
+驱动采用**板级静态参数 + probe 函数**结构，模仿真实 Linux/SylixOS 平台驱动的 probe 调用路径：
+
+```c
+/* 板级参数结构体（对应设备树节点属性） */
+typedef struct {
+    CPCHAR      compatible;     /* DT: compatible = "demoip,dma-1.00.a" */
+    CPCHAR      dev_name;       /* DMA 引擎设备名称                    */
+    phys_addr_t reg_base;       /* DT: reg[0] — 寄存器基地址           */
+    size_t      reg_size;       /* DT: reg[1] — 寄存器区域大小         */
+    INT         irq;            /* DT: interrupts — 中断号              */
+    INT         nr_channels;    /* DT: dma-channels — 通道数            */
+} demoip_board_params_t;
+
+/* 静态参数定义（对应 FMQL SoC AXI DMA 节点） */
+static const demoip_board_params_t _G_demoip_board_params = {
+    .compatible  = "demoip,dma-1.00.a",
+    .dev_name    = "demoip-dma",
+    .reg_base    = 0x43C00000UL,
+    .reg_size    = 0x10000,
+    .irq         = 89,
+    .nr_channels = 2,
+};
+```
+
+**调用链**：
+
+```text
+demoip_driver_init()
+  └─ __demoip_probe(&_G_demoip_board_params)
+       ├─ 打印板级资源信息（compatible / reg / irq / nr_channels）
+       ├─ 【真实硬件】映射寄存器：API_VmmMap(reg_base, reg_size)
+       ├─ 【真实硬件】注册中断：API_InterVectorConnect(irq, isr_fn, ...)
+       ├─ 填充 dma_device_t.ops
+       ├─ 按 nr_channels 挂入通道链表
+       └─ dma_async_device_register(dev)
+```
+
+**移植为真实硬件驱动的步骤**：
+
+1. 将 `__demoip_probe` 中的【真实硬件】注释块替换为实际 `API_VmmMap` / `API_InterVectorConnect` 调用。
+2. 将 `__demoip_alloc_chan_resources` 中的信号量/线程初始化移除，使用已注册的中断驱动传输。
+3. 将 `__demoip_prep_slave_sg` 中的描述符结构扩展为硬件 BD（Buffer Descriptor）格式。
+4. 将 `__demoip_issue_pending` 中的 `API_SemaphoreBPost` 替换为写硬件 tail pointer / doorbell 寄存器。
+5. 将 worker 线程替换为 ISR + 底半部（`API_InterDeferJobAdd`），在底半部调用 `dma_cookie_complete` 和回调。
+
+### 6.2 私有描述符结构
 
 ```c
 struct demoip_desc {
@@ -194,13 +242,6 @@ struct demoip_desc {
 };
 ```
 
-**移植为真实硬件驱动的步骤：**
-
-1. 将 `__demoip_alloc_chan_resources` 中的信号量/线程初始化替换为中断注册（`API_InterVectorConnect`）。
-2. 将 `__demoip_prep_slave_sg` 中的描述符结构扩展为硬件 BD（Buffer Descriptor）格式。
-3. 将 `__demoip_issue_pending` 中的 `API_SemaphoreBPost` 替换为写硬件 tail pointer / doorbell 寄存器。
-4. 将 worker 线程替换为 ISR + 底半部（`API_InterDeferJobAdd`），在底半部调用 `dma_cookie_complete` 和回调。
-
 ---
 
 ## 7. 测试命令说明
@@ -211,30 +252,30 @@ struct demoip_desc {
 
 | 命令 | 默认参数 | 说明 |
 | --- | --- | --- |
-| `dma_test_memcpy [size]` | size=4096 | 单次 MEM_TO_MEM memcpy 全链路（ch0） |
-| `dma_test_multi [cnt] [ent]` | cnt=8 ent=512 | 批量提交多描述符，`dma_sync_wait` 等待（ch1） |
-| `dma_test_sg [sg] [ent] [rx\|tx]` | sg=4 ent=512 rx | 单向 Slave SG 传输（ch0） |
-| `dma_test_loopback [sg] [ent] [rounds]` | sg=4 ent=512 rounds=1 | 半双工回环：TX 完成后 RX 再开始（ch0+ch1 串行） |
-| `dma_test_loopback_fd [sg] [ent] [rounds]` | sg=4 ent=512 rounds=1 | 全双工回环：TX ∥ RX 同时进行（ch0+ch1 并发） |
-| `dma_test_perf` | — | 15 种配置全自动性能基准（memcpy/NIC/Block） |
+| `dma_test_memcpy [size]` | size=4096 | 单次 MEM_TO_MEM memcpy 全链路（ch0），输出 BER |
+| `dma_test_multi [cnt] [ent]` | cnt=8 ent=512 | 批量提交多描述符，`dma_sync_wait` 等待（ch1），输出 BER |
+| `dma_test_sg [sg] [ent] [rx\|tx]` | sg=4 ent=512 rx | 单向 Slave SG 传输（ch0），输出 BER |
+| `dma_test_loopback_fd [sg] [ent] [rounds]` | sg=4 ent=512 rounds=1 | 全双工回环：TX ∥ RX 同时进行（ch0+ch1 并发），累计 TX/RX BER |
+| `dma_test_perf [duration_sec]` | duration=3 | 15 种配置计时性能基准，每秒报告 + 汇总表，显示 error_rounds |
 
-### 7.2 半双工回环（`dma_test_loopback`）
+### 7.2 BER 误码率统计
 
-TX 与 RX **串行**，TX 完成后 RX 才开始，ch0/ch1 共用同一 `dev_buf`：
+所有传输类命令（memcpy / multi / sg / loopback）均在传输完成后对参考数据与目标数据进行**逐字节比对**，输出格式：
 
 ```text
-[src_flat] ──TX(ch0, MEM_TO_DEV)──► [dev_buf] ──RX(ch1, DEV_TO_MEM)──► [dst_flat]
-verify: dst_flat == src_flat（逐 SG 条目比对）
-输出：TX 吞吐 / RX 吞吐 / RTT 往返吞吐
+[dma_test]   BER       0 errors / 4096 B  (0%)          ← 无误码
+[dma_test]   TX BER    0 errors / 192000 B  (0%)        ← 全双工 TX 侧
+[dma_test]   RX BER    3 errors / 192000 B  (0.00%)     ← 全双工 RX 侧（含 ppm）
 ```
 
-典型用法：
+- `loopback_fd` 跨**所有轮次**累计 TX/RX 误码，单轮失败不中止，最终输出累计 BER。
+- perf 基准不做逐字节校验（吞吐优先），传输执行失败时计入 `error_rounds` 并继续运行：
 
-```sh
-dma_test_loopback 3  500   100    # ETH 1500B 帧回环 100 次（NIC 压力测试）
-dma_test_loopback 1  4096  1000   # 4KB 块设备读写回环 1000 次（存储完整性）
-dma_test_loopback 1  512   5000   # 512B 扇区高频回环（吞吐量基准）
+```text
+[dma_test]  >> Summary: rounds=37714  errors=0     total=2413696B  time=3002ms  avg=251.2 MB/s
 ```
+
+汇总表在 `error_rounds > 0` 的场景末尾追加 `[err=N]` 标注。
 
 ### 7.3 全双工回环（`dma_test_loopback_fd`）
 
@@ -245,7 +286,7 @@ TX 与 RX **并发**，同时 `issue_pending`，ch0/ch1 使用**独立** `tx_fif
 [rx_fifo]  ──RX(ch1, DEV_TO_MEM)──► [dst_flat]
 每轮 issue 前：lib_memcpy(rx_fifo, src_flat) 模拟硬件回环已将 TX 数据搬至 RX 侧
 verify TX: tx_fifo == src_flat   verify RX: dst_flat == src_flat
-输出：TX 吞吐 / RX 吞吐 / FD 双向合计吞吐（= 2×bytes / max_lat）
+输出：TX 吞吐 / RX 吞吐 / FD 双向合计吞吐（= 2×bytes / t_wall，挂钟时间含全部开销）+ TX/RX 累计 BER
 ```
 
 典型用法：
@@ -256,17 +297,17 @@ dma_test_loopback_fd 1  4096  1000  # 4KB 块设备全双工读写 1000 次
 dma_test_loopback_fd 1  65536  200  # 64KB 顺序全双工 IO
 ```
 
-| 对比项 | 半双工（`dma_test_loopback`） | 全双工（`dma_test_loopback_fd`） |
-| --- | --- | --- |
-| 执行方式 | TX 完成 → RX 开始（串行） | TX ∥ RX 同时 issue（并发） |
-| 设备缓冲 | 共用 `dev_buf`（顺序安全） | 独立 `tx_fifo` / `rx_fifo`（无竞争） |
-| 等待机制 | `__dma_exec_once` × 2（共用 comp） | `__dma_exec_pair`（独立 comp_tx/comp_rx） |
-| 延迟测量 | `t_tx + t_rx`（串行累加） | `max(t_tx, t_rx)`（并发取较慢者） |
-| 适用场景 | 验证单通道数据正确性 | 验证全双工并发完整性及实际双向吞吐 |
+### 7.4 性能基准（`dma_test_perf [duration_sec]`）
 
-### 7.4 性能基准场景（`dma_test_perf`）
+每个场景**以时间为界**持续运行，默认 3 秒/场景（可通过参数调整）。
 
-自动运行 15 种配置，覆盖三类典型设备：
+**输出层次**：
+
+1. **每秒中间报告**：每个计时区间（≈1 秒）输出本区间完成轮数和吞吐率。
+2. **场景摘要**：每个场景结束后输出总轮数、总字节、总耗时和平均吞吐率。
+3. **汇总表**：所有 15 个场景完成后，输出对齐格式的汇总表格。
+
+**场景覆盖**（15 种）：
 
 | 类别   | 场景示例                                           |
 |--------|----------------------------------------------------|
@@ -274,33 +315,37 @@ dma_test_loopback_fd 1  65536  200  # 64KB 顺序全双工 IO
 | NIC    | ETH 标准帧 SG=3×500B / Jumbo SG=8×1125B（RX+TX） |
 | Block  | 512B 扇区 / 4KB 页 / 128KB 顺序 / 512KB 大块      |
 
-### 7.5 预期输出示例
+**计时精度说明**：
+
+- 个体传输（软件模拟）通常在 1 tick（1 ms）内完成，`ticks_per_round = 0`。
+- 吞吐计算改用**累计挂钟时间**：`KB/s = sec_bytes × tickrate / (elapsed_ticks × 1024)`，
+  在 1 秒区间内累计可得有意义的速率，不受单次 ticks=0 影响。
+
+**示例输出**：
 
 ```text
-[dma_test] ===== memcpy  size=4096B  ch=0 =====
-[dma_test]   src=0x...  dst=0x...  len=4096B
-[dma_test]   time=1ms  4.0 MB/s
-[dma_test]   verify OK
-[dma_test] PASS
+[dma_test]  memcpy   64B  ctrl        M->M  SG=1      64B  3s:
+[dma_test]    [  1s]  rounds=12543    250.8 MB/s
+[dma_test]    [  2s]  rounds=12601    251.7 MB/s
+[dma_test]    [  3s]  rounds=12570    251.2 MB/s
+[dma_test]  >> Summary: rounds=37714  errors=0     total=2413696B  time=3002ms  avg=251.2 MB/s
 
-[dma_test] ===== loopback  sg=3  entry=500B  total=1500B  rounds=100 =====
-[dma_test]   path: src_flat --TX(ch0)--> dev_buf --RX(ch1)--> dst_flat
-[dma_test]   TX='fream-dma-ch0'  RX='fream-dma-ch1'  dev_buf=0x...
-[dma_test]   TX  : time=105ms  1.3 MB/s
-[dma_test]   RX  : time=102ms  1.4 MB/s
-[dma_test]   RTT : time=207ms  0.6 MB/s
-[dma_test]   verify: 100 rounds × 3 SG entries OK
-[dma_test] PASS
+[dma_test] ====================================================
+[dma_test]  Summary Table  (duration=3s/scenario)
+[dma_test]  Scenario                 Dir   SG   Entry-B  Time-ms  Throughput
+[dma_test] ----------------------------------------------------
+[dma_test]  memcpy   64B  ctrl       M->M   1       64B     3002  251.2 MB/s
+[dma_test]  memcpy  512B  eth        M->M   1      512B     3001  248.7 MB/s  [err=2]
+...
+[dma_test] ====================================================
+```
 
-[dma_test] ===== loopback-fd  sg=3  entry=500B  total=1500B  rounds=100 =====
-[dma_test]   mode: FULL-DUPLEX (TX || RX concurrent, separate FIFOs)
-[dma_test]   TX='fream-dma-ch0'  tx_fifo=0x...
-[dma_test]   RX='fream-dma-ch1'  rx_fifo=0x...  (pre-loaded each round)
-[dma_test]   TX  : time=106ms  1.3 MB/s
-[dma_test]   RX  : time=106ms  1.3 MB/s
-[dma_test]   FD  : time=106ms  2.6 MB/s
-[dma_test]   verify: 100 rounds × 3 SG entries (TX+RX both sides) OK
-[dma_test] PASS
+典型用法：
+
+```sh
+dma_test_perf          # 默认 3s/场景，总计约 45s
+dma_test_perf 10       # 每场景 10s，总计约 150s，更精确的稳态吞吐
+dma_test_perf 1        # 快速冒烟，每场景 1s
 ```
 
 ---
@@ -338,11 +383,11 @@ dma_test_loopback_fd 1  65536  200  # 64KB 顺序全双工 IO
 | --- | --- | --- |
 | 异步回调（推荐） | `callback_result` + 二进制信号量 | 生产代码，不阻塞调用线程 |
 | 同步轮询 | `dma_sync_wait`（1 tick 间隔轮询） | 调试、简单脚本（`dma_test_multi` 使用） |
-| 并发双路等待 | `__dma_exec_pair`（两个独立 sem，顺序 pend） | 全双工测试，无需额外线程 |
+| 并发双路等待 | `__dma_exec_pair`（共享屏障信号量，两路回调均完成后 post 一次） | 全双工测试，消除双路顺序 pend 的额外上下文切换开销 |
 
 `__dma_exec_once` 封装单路流程：`API_SemaphoreBClear`（清除历史 post）→ submit → issue → `API_SemaphoreBPend`（5 s 超时）。
 
-`__dma_exec_pair` 封装双路流程：清除两个 sem → 同时 submit 两路 → 同时 `issue_pending` → 顺序 pend 两个 sem。计时从双路 issue 到两者均完成，反映全双工实际延迟 `≈ max(t_tx, t_rx)`。任一超时则对两通道均调用 `dmaengine_terminate_all`。
+`__dma_exec_pair` 封装双路流程：内部创建 `dma_pair_sync_t`（共享信号量 + 自旋锁 + 倒计时 `remaining=2`）→ 同时 submit 两路、设置各自回调 → 同时 `issue_pending` → 主线程仅 `pend` 一次。每路回调递减 `remaining`，降至 0 的一路负责 post 共享信号量。计时从双路 issue 到共享信号量被 post，反映全双工实际延迟 `≈ max(t_tx, t_rx)`，且同步开销与单通道相同（仅一次上下文切换往返）。任一超时则对两通道均调用 `dmaengine_terminate_all`。
 
 ### 8.5 Slave SG 设备地址管理
 
@@ -351,20 +396,49 @@ dma_test_loopback_fd 1  65536  200  # 64KB 顺序全双工 IO
 - `MEM_TO_DEV`：`dev_addr = slave_cfg.dst_addr`
 - `DEV_TO_MEM`：`dev_addr = slave_cfg.src_addr`
 
-每通道 `slave_cfg` 独立存储，支持 ch0/ch1 配置不同方向和地址。两种回环测试都利用此特性：
-
-- 半双工：ch0 `dst_addr=dev_buf`，ch1 `src_addr=dev_buf`（共用，TX→RX 串行）
-- 全双工：ch0 `dst_addr=tx_fifo`，ch1 `src_addr=rx_fifo`（独立，并发无竞争）
+每通道 `slave_cfg` 独立存储，支持 ch0/ch1 配置不同方向和地址。全双工回环测试利用此特性：ch0 `dst_addr=tx_fifo`，ch1 `src_addr=rx_fifo`（独立，并发无竞争）。
 
 ### 8.6 计时精度与吞吐计算
 
 计时使用 `API_TimeGet64()` 返回 64-bit tick 计数，差值 `ticks = t1 - t0`。
 
-**精度限制**：测量粒度为 1 tick（默认 1 ms @ 1000 Hz）。传输在同一 tick 内完成时 `ticks = 0`，此时无法计算吞吐量，打印 `N/A`。软件模拟 DMA 的小包传输（< 1 ms）通常落入此情形，属正常现象。
+**精度限制**：测量粒度为 1 tick（默认 1 ms @ 1000 Hz）。传输在同一 tick 内完成时 `ticks = 0`，此时无法计算单次吞吐量。性能测试改用区间累计时间（≥1 秒），避免单次 ticks=0 导致 N/A。
 
 **吞吐公式**：`KB/s = bytes × tickrate / (ticks × 1024)`
 
 中间积 `bytes × tickrate` 在 tickrate ≤ 10 000 Hz 时最大约 5.4 × 10¹⁷，不超过 UINT64 上限（1.8 × 10¹⁹）。移植到 tickrate > 300 kHz 的平台时，需将乘法改为先除后乘（`bytes/1024 × tickrate / ticks`）以避免溢出。
+
+### 8.7 板级参数 probe 模式
+
+驱动入口采用**静态参数 + probe 函数**分离的结构（见第 6.1 节），原因：
+
+1. **对应真实驱动架构**：Linux/SylixOS 平台驱动由框架在解析设备树后调用 `probe()`，此处以静态参数显式调用等价于单实例 platform_device 的注册流程，结构对齐，移植时只需将静态参数来源改为 OF 解析结果。
+2. **集中管理硬件资源**：寄存器基地址、中断号、通道数等硬件相关常量集中在一个结构体中，不散落于初始化函数内部，便于多板卡适配（只需修改参数表）。
+3. **清晰的移植路径**：probe 函数中以注释标注了【真实硬件替换点】，移植者只需在对应位置补充 `API_VmmMap` / `API_InterVectorConnect` 调用，无需重写整个初始化逻辑。
+
+### 8.8 BER 误码率统计设计
+
+BER（Bit Error Rate，误码率）统计以**字节**为最小单位（byte error rate），实现在 `test/dma_test.c`：
+
+```c
+typedef struct {
+    UINT64  total_bytes;   /* 参与校验的总字节数 */
+    UINT64  error_bytes;   /* 与参考数据不一致的字节数 */
+} dma_ber_stat_t;
+```
+
+- `__dma_count_errors(ref, dut, len)`：逐字节比对，返回不匹配字节数。
+- `__print_ber(label, stat)`：误码为 0 时直接显示 `0 errors`；误码非 0 时以 ppm 精度计算并格式化为百分比（`error_bytes × 1000000 / total_bytes`，显示到小数点后 2 位）。
+- **loopback_fd**：跨所有轮次**累计**误码，单轮失败不中止测试，最终输出 TX/RX 两路独立 BER，便于区分发送侧与接收侧质量。
+- 测试框架不在驱动层执行校验，驱动只负责搬运数据；校验逻辑集中在测试层，保持关注点分离。
+
+### 8.9 性能基准 error_rounds 设计
+
+`dma_test_perf` 的每轮传输若遇到执行失败（`__dma_exec_once` 返回非零），原先会中止整个场景并标记 `failed`。改为：
+
+- 失败轮计入 `result->error_rounds`，`continue` 进入下一轮，场景继续运行至时间耗尽。
+- 场景摘要行追加 `errors=N` 字段，汇总表在 `error_rounds > 0` 时追加 `[err=N]` 后缀。
+- 设计意图：偶发性传输失败（超时/资源不足）不应掩盖整体吞吐数据，同时通过 `errors` 字段提示问题存在，方便区分"性能低"与"功能不稳定"两种不同问题。
 
 ---
 
@@ -374,11 +448,11 @@ dma_test_loopback_fd 1  65536  200  # 64KB 顺序全双工 IO
 
 ```text
 src/dmaengine.c
-src/hw/fream/demoip.c
+src/hw/demoip/demoip.c
 src/test/dma_test.c
 src/dma.c
 ```
 
-头文件包含路径需覆盖 `src/`，使 `hw/fream/demoip.c` 能以 `../../dmaengine.h` 找到框架头文件，`test/dma_test.c` 能以 `../dmaengine.h` 找到框架头文件。
+头文件包含路径需覆盖 `src/`，使 `hw/demoip/demoip.c` 能以 `../../dmaengine.h` 找到框架头文件，`test/dma_test.c` 能以 `../dmaengine.h` 找到框架头文件。
 
 > 实际接口由 `SylixOS.h` 提供，`drv/os_common.h` 仅为开发阶段参考，不包含在工程编译中。

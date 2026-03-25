@@ -32,7 +32,7 @@
 #include <SylixOS.h>
 #include <module.h>
 #include "dmaengine.h"
-#include "hw/fream/demoip.h"
+#include "hw/demoip/demoip.h"
 
 /*
  *  来自 test/dma_test.c 的命令注册函数
