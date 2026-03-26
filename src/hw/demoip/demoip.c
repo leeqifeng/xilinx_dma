@@ -669,84 +669,76 @@ static INT  __demoip_terminate_all (dma_chan_t *chan)
     return  (0);
 }
 
-/*================================================ 板级参数与 probe 入口 ==================================*/
-
-/*********************************************************************************************************
-**  板级静态参数（模仿设备树节点信息）
-**
-**  真实驱动中，这些字段由 OF / ACPI 框架解析设备树后填入并传给 probe()：
-**    compatible  ← DT: compatible = "demoip,dma-1.00.a"
-**    reg_base    ← DT: reg = <0x43C00000 0x10000>（寄存器基地址）
-**    reg_size    ← DT: reg 第二个元素（寄存器区域大小）
-**    irq         ← DT: interrupts = <0 57 4>（经 GIC 映射后的 SylixOS 中断号）
-**    nr_channels ← DT: dma-channels = <2>
-**    dev_name    ← 驱动代码内定义，不来自 DT，但在此集中管理便于多实例区分
-**
-**  软件模拟版本中 reg_base / irq 仅作说明，不做实际映射/注册。
-**
-*********************************************************************************************************/
-
-typedef struct {
-    CPCHAR      compatible;                                             /*  设备兼容字符串              */
-    CPCHAR      dev_name;                                               /*  DMA 引擎设备名称            */
-    phys_addr_t reg_base;                                               /*  寄存器基地址 (DT: reg[0])   */
-    size_t      reg_size;                                               /*  寄存器区域大小 (DT: reg[1]) */
-    INT         irq;                                                    /*  中断号 (DT: interrupts)     */
-    INT         nr_channels;                                            /*  DMA 通道数 (DT: dma-channels)*/
-} demoip_board_params_t;
+/*================================================ 两阶段初始化入口 ======================================*/
 
 /*
- *  静态板级参数定义（对应 FMQL SoC 上的 AXI DMA 控制器节点）
+ *  驱动库 ops 表（阶段1 注册后供阶段2填充设备实例使用）
  */
-static const demoip_board_params_t  _G_demoip_board_params = {
-    .compatible  = "demoip,dma-1.00.a",
-    .dev_name    = DEMOIP_DEV_NAME,
-    .reg_base    = 0x43C00000UL,
-    .reg_size    = 0x10000,
-    .irq         = 89,
-    .nr_channels = DEMOIP_MAX_CHANS,
-};
+static BOOL  _G_demoip_lib_inited = LW_FALSE;
 
 /*********************************************************************************************************
-** 函数名称: __demoip_probe
-** 功能描述: Demo IP DMA 驱动 probe 函数（使用板级参数完成驱动初始化并注册到框架）
-** 输　入  : params — 板级参数指针（来自静态定义或设备树解析结果）
+** 函数名称: demoip_lib_init
+** 功能描述: 阶段1 — 驱动库初始化，注册驱动能力
+** 输　入  : NONE
+** 输　出  : 0 成功；-1 已初始化或失败
+** 说明    : 只执行一次；后续 demoip_params_register 可调用多次注册不同硬件实例
+*********************************************************************************************************/
+
+INT  demoip_lib_init (VOID)
+{
+    if (_G_demoip_lib_inited) {
+        return  (0);
+    }
+    _G_demoip_lib_inited = LW_TRUE;
+    printk("[demoip] library initialized (memcpy + slave-sg)\n");
+    return  (0);
+}
+
+/*********************************************************************************************************
+** 函数名称: demoip_params_register
+** 功能描述: 阶段2 — 绑定板级硬件实例，分配设备并注册到框架
+** 输　入  : params — 板级参数指针（来自 dma.c 的静态定义）
 ** 输　出  : 0 成功；-1 失败
 **
-**  probe 执行步骤：
-**    1. 校验参数合法性（nr_channels 范围、地址非零）
-**    2. 打印板级资源信息（对应真实驱动中的 dev_info 输出）
+**  执行步骤：
+**    1. 校验参数合法性
+**    2. 打印板级资源信息
 **    3. 【真实硬件】映射寄存器：API_VmmMap(params->reg_base, params->reg_size)
 **    4. 【真实硬件】注册中断：API_InterVectorConnect(params->irq, isr_fn, ...)
-**    5. 填充 dma_device_t 并注册到 DMA Engine 框架
+**    5. 填充 dma_device_t（ops 来自驱动库）并注册到框架
 **
 **  注意：步骤 3/4 在软件模拟版本中跳过，仅打印提示。
 **
 *********************************************************************************************************/
 
-static INT  __demoip_probe (const demoip_board_params_t *params)
+INT  demoip_params_register (const demoip_board_params_t *params)
 {
     struct demoip_device  *ddev = &_G_demoip_dev;
     dma_device_t          *dev  = &ddev->base;
     INT                    i;
 
+    if (!_G_demoip_lib_inited) {
+        printk("[demoip] params_register: library not initialized, call demoip_lib_init first\n");
+        return  (-1);
+    }
+
     if (!params || params->nr_channels <= 0 ||
         params->nr_channels > DEMOIP_MAX_CHANS) {
-        printk("[demoip] probe: invalid params (nr_channels=%d, max=%d)\n",
+        printk("[demoip] params_register: invalid params (nr_channels=%d, max=%d)\n",
                params ? params->nr_channels : -1, DEMOIP_MAX_CHANS);
         return  (-1);
     }
 
-    printk("[demoip] probe: compatible='%s'\n", params->compatible);
-    printk("[demoip] probe: reg=0x%08lx/0x%zx  irq=%d  nr_channels=%d\n",
+    printk("[demoip] params_register: compatible='%s'\n", params->compatible);
+    printk("[demoip] params_register: reg=0x%08lx/0x%zx  irq=%d  nr_channels=%d\n",
            (unsigned long)params->reg_base, params->reg_size,
            params->irq, params->nr_channels);
-    printk("[demoip] probe: (software simulation — reg/irq not mapped)\n");
+    printk("[demoip] params_register: (software simulation — reg/irq not mapped)\n");
 
     /*
      *  【真实硬件替换点 1】映射寄存器基地址
-     *  base = API_VmmMap(params->reg_base, params->reg_size,
-     *                    LW_VMM_FLAG_RDWR | LW_VMM_FLAG_NO_CACHE);
+     *  base = API_VmmMap((PVOID)params->reg_base, (PVOID)params->reg_base,
+     *                    params->reg_size, LW_VMM_FLAG_DMA);
      *
      *  【真实硬件替换点 2】注册中断向量
      *  API_InterVectorConnect(params->irq, __demoip_isr, ddev, "demoip");
@@ -772,45 +764,16 @@ static INT  __demoip_probe (const demoip_board_params_t *params)
         struct demoip_chan  *dchan = &ddev->chans[i];
 
         snprintf(dchan->base.chan_name, sizeof(dchan->base.chan_name),
-                     "%s-ch%d", params->dev_name, i);
+                 "%s-ch%d", params->dev_name, i);
         dchan->base.device = dev;
         _LIST_LINE_INIT_IN_CODE(dchan->base.node);
         _List_Line_Add_Tail(&dchan->base.node, &dev->channels);
     }
     dev->chancnt = params->nr_channels;
 
-    printk("[demoip] probe OK: dev='%s'  %d channels (memcpy + slave-sg)\n",
+    printk("[demoip] params_register OK: dev='%s'  %d channels\n",
            params->dev_name, params->nr_channels);
     return  dma_async_device_register(dev);
-}
-
-/*********************************************************************************************************
-** 函数名称: demoip_driver_init
-** 功能描述: Demo IP DMA 驱动初始化入口（模块加载时调用）
-** 输　入  : NONE
-** 输　出  : 0 成功；-1 失败
-** 说明    : 以静态板级参数调用 __demoip_probe()，模仿真实驱动中设备树 probe 的调用路径。
-**           真实 SylixOS/Linux 驱动框架会在解析设备树后自动调用 probe()，
-**           此处用静态参数显式调用等价于单实例 platform_device 的注册流程。
-*********************************************************************************************************/
-
-INT  demoip_driver_init (VOID)
-{
-    return  __demoip_probe(&_G_demoip_board_params);
-}
-
-/*********************************************************************************************************
-** 函数名称: demoip_driver_exit
-** 功能描述: Demo IP DMA 驱动注销入口
-** 输　入  : NONE
-** 输　出  : NONE
-** 注意    : 调用前须保证所有通道已通过 dma_release_channel 释放。
-*********************************************************************************************************/
-
-VOID  demoip_driver_exit (VOID)
-{
-    dma_async_device_unregister(&_G_demoip_dev.base);
-    printk("[demoip] driver exit\n");
 }
 /*********************************************************************************************************
   END

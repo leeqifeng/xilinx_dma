@@ -14,17 +14,27 @@
 
 ```text
 src/
-├── dma.c                   内核模块入口（module_init / module_exit），包含用户静态板级配置，如ip厂家，型号等信息
+├── dma.c                   内核模块入口（module_init / module_exit）
+│                           - 包含所有硬件的板级配置参数（集中管理）
+│                           - 调用各驱动库的 probe 接口完成注册
 ├── dmaengine.h             框架核心头文件（数据结构 + 公开 API + inline helpers）
 ├── dmaengine.c             框架核心实现（全局设备链表管理、通道调度、状态查询）
-├── os_common.h             操作系统提供的接口示例，因代码量过大，这里只是一部分接口示例（实际工程中包含sylixos.h，不存在os_common.h）
+├── os_common.h             操作系统提供的接口示例（实际工程中包含 SylixOS.h）
 ├── hw/
-│   └── demoip/
-│       ├── demoip.h        Demo IP 初始化声明，不包含驱动相关信息
-│       └── demoip.c        Demo IP 纯软件模拟 DMA 驱动（memcpy + Slave SG，移植参考模板）
+│   ├── demoip/
+│   │   ├── demoip.h        Demo IP 驱动库公开接口（probe 函数声明）
+│   │   └── demoip.c        Demo IP 驱动库实现（纯软件模拟，不含板级参数）
+│   └── xilinx/
+│       ├── xilinx.h        Xilinx DMA 驱动库公开接口（probe 函数声明）
+│       └── xilinx.c        Xilinx DMA 驱动库实现（支持 4 种 IP，不含板级参数）
 └── test/
     └── dma_test.c          tshell 测试套件（5 个命令，含 BER 误码率统计）
 ```
+
+**架构说明**：
+- `dma.c` 是唯一包含板级配置的文件，集中管理所有 DMA 控制器的硬件参数
+- `hw/xxx/xxx.c` 是纯驱动库，只提供 `xxx_probe(params)` 接口，不包含任何板级参数
+- `module_init` 按需调用各驱动库的 probe 函数，传入对应的板级参数
 
 ---
 
@@ -65,16 +75,36 @@ dma_device_t                                dma_chan_t
 
 ## 4. 数据流与生命期
 
-### 4.1 驱动注册流程
+### 4.1 驱动注册流程（两阶段初始化）
 
 ```text
-硬件驱动 init()
+module_init (dma.c)
   │
-  ├─ 填充 dma_device_t（dev_name, chancnt, ops）
-  ├─ 初始化通道数组，将各 dma_chan_t.node 加入 device->channels 链表
-  └─ dma_async_device_register(device)
-       └─ 校验必须 ops → 加入全局 _G_dma_device_list
+  ├─ dma_engine_init()                    初始化框架全局状态
+  │
+  ├─ 阶段1: 驱动库初始化（注册驱动能力）
+  │    ├─ demoip_lib_init()              注册 Demo IP 驱动库的 ops 和能力
+  │    └─ xilinx_dma_lib_init()          注册 Xilinx 驱动库的 ops 和能力
+  │
+  ├─ 阶段2: 硬件实例注册（绑定板级参数）
+  │    ├─ 定义板级参数（集中在 dma.c）
+  │    │    static const demoip_board_params_t _G_demoip_params = { ... };
+  │    │    static const xilinx_board_params_t _G_xilinx_params = { ... };
+  │    │
+  │    ├─ demoip_params_register(&_G_demoip_params)
+  │    │    └─ 分配设备实例 → 填充 ops → dma_async_device_register()
+  │    │
+  │    └─ xilinx_dma_params_register(&_G_xilinx_params)
+  │         └─ 分配设备实例 → 填充 ops → dma_async_device_register()
+  │
+  └─ dma_test_register_cmds()            注册测试命令
 ```
+
+**两阶段设计优势**：
+- **支持多实例**：同一驱动库可注册多个硬件实例（如多块 Xilinx DMA 板卡）
+- **延迟绑定**：驱动能力在启动时注册，硬件实例可运行时动态添加
+- **职责分离**：lib_init 注册能力，params_register 绑定硬件
+- **代码复用**：ops 定义在驱动库中，多个实例共享同一套 ops
 
 ### 4.2 通道申请/释放流程
 
