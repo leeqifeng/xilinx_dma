@@ -34,6 +34,7 @@
 
 typedef struct {
     CPCHAR      compatible;
+    CPCHAR      dev_name;
     phys_addr_t reg_base;
     size_t      reg_size;
     struct {
@@ -43,6 +44,7 @@ typedef struct {
     } child[2];
     UINT32      xlnx_datawidth;
     UINT32      xlnx_addrwidth;
+    UINT32      max_buffer_len;
 } xilinx_board_params_t;
 
 /*********************************************************************************************************

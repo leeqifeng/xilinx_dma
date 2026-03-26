@@ -69,6 +69,7 @@ static const demoip_board_params_t _G_demoip_params = {
 
 static const xilinx_board_params_t _G_xilinx_params = {
     .compatible      = "xlnx,axi-dma-1.00.a",
+    .dev_name        = "xilinx-dma",
     .reg_base        = 0x40400000,
     .reg_size        = 0x10000,
     .child = {
@@ -85,6 +86,7 @@ static const xilinx_board_params_t _G_xilinx_params = {
     },
     .xlnx_datawidth  = 32,
     .xlnx_addrwidth  = 32,
+    .max_buffer_len  = (1 << 23) - 1,
 };
 
 /*********************************************************************************************************

@@ -764,13 +764,39 @@ static irqreturn_t xilinx_dma_irq_handler(PVOID data, ULONG vector)
 
 ### 8.1 分阶段实施
 
-**阶段1**: 基础框架(8天)
+**阶段1**: 基础框架(8天) ✅ **已完成**
 
-- 数据结构定义(所有IP类型)
-- 寄存器访问封装
-- Probe机制(主probe+child+chan)
-- Config匹配机制
-- 注册到DMAengine框架
+- ✅ 数据结构定义(所有IP类型)
+  - 4种硬件描述符: VDMA/AXIDMA/CDMA/MCDMA
+  - TX段结构: 包含硬件描述符+链表节点+物理地址
+  - TX描述符结构: 软件管理的传输描述符
+  - 通道结构: 包含pending/active/done队列、slave配置、函数指针
+  - 设备结构: 包含寄存器映射、IP配置、通道数组
+- ✅ 寄存器访问封装
+  - dma_read/dma_write内联函数
+  - 完整的DMACR/DMASR寄存器位定义
+  - 描述符控制字段位定义(SOP/EOP)
+- ✅ Probe机制(主probe+child+chan)
+  - xilinx_dma_params_register: 主probe入口
+  - xilinx_dma_child_probe: 子节点probe(MM2S/S2MM)
+  - xilinx_dma_chan_probe: 通道probe，初始化所有字段
+  - 修复通道ID分配逻辑，支持不同子节点通道数
+- ✅ Config匹配机制
+  - xilinx_match_config: 根据compatible字符串匹配IP配置
+  - 支持4种IP类型配置表
+- ✅ 注册到DMAengine框架
+  - 实现必需的device ops stub函数
+  - 添加device_config和device_terminate_all
+  - 修复max_buffer_len计算bug
+  - 添加dev_name字段支持
+
+**关键修复**:
+
+1. 修复max_buffer_len未定义行为(从xlnx_datawidth改为独立参数)
+2. 添加dev_name字段到板级参数
+3. 完善通道结构，添加done_list/slave_cfg等字段
+4. 优化通道ID分配逻辑，避免ID空洞
+5. 移除alloc_chan_resources中的重复锁初始化
 
 **阶段2**: AXI DMA实现(10天)
 
