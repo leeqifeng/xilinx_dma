@@ -60,6 +60,8 @@
 #define XILINX_DMA_REG_CURDESC_MSB          0x000C
 #define XILINX_DMA_REG_TAILDESC             0x0010
 #define XILINX_DMA_REG_TAILDESC_MSB         0x0014
+#define XILINX_DMA_REG_SRCDSTADDR           0x0018
+#define XILINX_DMA_REG_BTT                  0x0028
 
 /*********************************************************************************************************
   DMACR 控制寄存器位定义
@@ -71,6 +73,7 @@
 #define XILINX_DMA_DMACR_FRM_CNT_IRQ        (1 << 12)
 #define XILINX_DMA_DMACR_DLY_CNT_IRQ        (1 << 13)
 #define XILINX_DMA_DMACR_ERR_IRQ            (1 << 14)
+#define XILINX_DMA_CR_CYCLIC_BD_EN_MASK     (1 << 4)
 
 /*********************************************************************************************************
   DMASR 状态寄存器位定义
@@ -85,6 +88,15 @@
 #define XILINX_DMA_DMASR_DLY_CNT_IRQ        (1 << 13)
 #define XILINX_DMA_DMASR_ERR_IRQ            (1 << 14)
 
+#define XILINX_DMA_DMAXR_ALL_IRQ_MASK       \
+    (XILINX_DMA_DMASR_FRM_CNT_IRQ | XILINX_DMA_DMASR_DLY_CNT_IRQ | XILINX_DMA_DMASR_ERR_IRQ)
+
+#define XILINX_DMA_DMASR_ALL_ERR_MASK       \
+    (XILINX_DMA_DMASR_DMA_INT_ERR | XILINX_DMA_DMASR_DMA_SLAVE_ERR | XILINX_DMA_DMASR_DMA_DEC_ERR)
+
+#define XILINX_DMA_DMASR_ERR_RECOVER_MASK   \
+    (XILINX_DMA_DMASR_DMA_INT_ERR)
+
 /*********************************************************************************************************
   描述符控制字段位定义
 *********************************************************************************************************/
@@ -94,9 +106,21 @@
 /*********************************************************************************************************
   硬件限制
 *********************************************************************************************************/
+#define GENMASK(h, l) \
+    (((~0UL) - (1UL << (l)) + 1) & (~0UL >> (31 - (h))))
+
+#define XILINX_DMA_LOOP_COUNT               1000000
 #define XILINX_DMA_MAX_CHANS_PER_DEVICE     2
 #define XILINX_CDMA_MAX_CHANS_PER_DEVICE    1
 #define XILINX_MCDMA_MAX_CHANS_PER_DEVICE   32
+
+/*********************************************************************************************************
+  中断合并配置
+*********************************************************************************************************/
+#define XILINX_DMA_COALESCE_MAX             255
+#define XILINX_DMA_DELAY_MAX                255
+#define XILINX_DMA_CR_COALESCE_MAX          GENMASK(23, 16)
+#define XILINX_DMA_CR_COALESCE_SHIFT        16
 
 /*********************************************************************************************************
   IP 类型枚举
@@ -228,14 +252,17 @@ typedef struct xilinx_dma_chan {
     PLW_LIST_LINE                   active_list;
     PLW_LIST_LINE                   done_list;
     PLW_LIST_LINE                   free_seg_list;
+    xilinx_axidma_tx_segment_t     *cyclic_seg_v;
     INT                             id;
     dma_transfer_direction_t        direction;
     BOOL                            has_sg;
     BOOL                            cyclic;
     BOOL                            err;
     BOOL                            idle;
+    BOOL                            terminating;
     INT                             irq;
     dma_slave_config_t              slave_cfg;
+    LW_OBJECT_HANDLE                defer_job;
     VOID                            (*start_transfer)(struct xilinx_dma_chan *chan);
     INT                             (*stop_transfer)(struct xilinx_dma_chan *chan);
 } xilinx_dma_chan_t;
@@ -276,20 +303,39 @@ static const xilinx_dma_config_t aximcdma_config = {
 };
 
 /*********************************************************************************************************
-  寄存器访问封装
+** 函数名称: dma_read
+** 功能描述: 读取 DMA 通道寄存器
+** 输　入  : chan      - 通道指针
+**           reg       - 寄存器偏移
+** 输　出  : 寄存器值
+** 全局变量:
+** 调用模块:
 *********************************************************************************************************/
 static inline UINT32 dma_read (xilinx_dma_chan_t *chan, UINT32 reg)
 {
     return read32((addr_t)chan->xdev->regs + chan->ctrl_offset + reg);
 }
-
+/*********************************************************************************************************
+** 函数名称: dma_write
+** 功能描述: 写入 DMA 通道寄存器
+** 输　入  : chan      - 通道指针
+**           reg       - 寄存器偏移
+**           val       - 写入值
+** 输　出  : NONE
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
 static inline VOID dma_write (xilinx_dma_chan_t *chan, UINT32 reg, UINT32 val)
 {
     write32(val, (addr_t)chan->xdev->regs + chan->ctrl_offset + reg);
 }
-
 /*********************************************************************************************************
-  Config 匹配函数
+** 函数名称: xilinx_match_config
+** 功能描述: 根据 compatible 字符串匹配 IP 配置
+** 输　入  : compatible - 设备兼容字符串
+** 输　出  : IP 配置指针；LW_NULL 表示不支持
+** 全局变量:
+** 调用模块:
 *********************************************************************************************************/
 static const xilinx_dma_config_t *xilinx_match_config (CPCHAR compatible)
 {
@@ -309,37 +355,477 @@ static const xilinx_dma_config_t *xilinx_match_config (CPCHAR compatible)
 }
 
 /*********************************************************************************************************
-  DMAengine ops 实现（阶段1：最小桩函数）
+  描述符内存管理
+*********************************************************************************************************/
+#define XILINX_DMA_NUM_DESCS                255
+#define XILINX_DMA_NUM_APP_WORDS            5
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_alloc_tx_descriptor
+** 功能描述: 分配传输描述符
+** 输　入  : chan      - 通道指针
+** 输　出  : 描述符指针；LW_NULL 表示失败
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static xilinx_dma_tx_descriptor_t *xilinx_dma_alloc_tx_descriptor (xilinx_dma_chan_t *chan)
+{
+    xilinx_dma_tx_descriptor_t *desc;
+
+    desc = (xilinx_dma_tx_descriptor_t *)sys_malloc(sizeof(xilinx_dma_tx_descriptor_t));
+    if (!desc) {
+        return LW_NULL;
+    }
+    lib_bzero(desc, sizeof(xilinx_dma_tx_descriptor_t));
+    desc->segments = LW_NULL;
+    return desc;
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_set_coalesce
+** 功能描述: 配置中断合并参数
+** 输　入  : chan      - 通道指针
+**           frame_cnt - 帧计数阈值（0 禁用）
+**           delay_cnt - 延迟计数阈值（0 禁用）
+** 输　出  : NONE
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static VOID xilinx_dma_set_coalesce (xilinx_dma_chan_t *chan, UINT32 frame_cnt, UINT32 delay_cnt)
+{
+    UINT32 reg;
+
+    reg = dma_read(chan, XILINX_DMA_REG_DMACR);
+    reg &= ~((XILINX_DMA_COALESCE_MAX << 16) | (XILINX_DMA_DELAY_MAX << 24));
+
+    if (frame_cnt > 0) {
+        reg |= XILINX_DMA_DMACR_FRM_CNT_IRQ;
+        reg |= (frame_cnt & XILINX_DMA_COALESCE_MAX) << 16;
+    }
+
+    if (delay_cnt > 0) {
+        reg |= XILINX_DMA_DMACR_DLY_CNT_IRQ;
+        reg |= (delay_cnt & XILINX_DMA_DELAY_MAX) << 24;
+    }
+
+    dma_write(chan, XILINX_DMA_REG_DMACR, reg);
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_free_tx_descriptor
+** 功能描述: 释放传输描述符并归还段到空闲链表
+** 输　入  : chan      - 通道指针
+**           desc      - 描述符指针
+** 输　出  : NONE
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static VOID xilinx_dma_free_tx_descriptor (xilinx_dma_chan_t *chan, xilinx_dma_tx_descriptor_t *desc)
+{
+    xilinx_axidma_tx_segment_t *segment, *next;
+    PLW_LIST_LINE pline;
+
+    if (!desc) {
+        return;
+    }
+
+    pline = desc->segments;
+    while (pline) {
+        segment = _LIST_ENTRY(pline, xilinx_axidma_tx_segment_t, node);
+        pline = _list_line_get_next(pline);
+        _List_Line_Add_Tail(&segment->node, &chan->free_seg_list);
+    }
+
+    sys_free(desc);
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_axidma_alloc_tx_segment
+** 功能描述: 从空闲链表分配传输段
+** 输　入  : chan      - 通道指针
+** 输　出  : 段指针；LW_NULL 表示无可用段
+** 全局变量:
+** 调用模块:
+** 注意    : 函数内部加锁保护 free_seg_list
+*********************************************************************************************************/
+static xilinx_axidma_tx_segment_t *xilinx_axidma_alloc_tx_segment (xilinx_dma_chan_t *chan)
+{
+    xilinx_axidma_tx_segment_t *segment;
+    INTREG ireg;
+
+    LW_SPIN_LOCK_IRQ(&chan->lock, &ireg);
+    if (!chan->free_seg_list) {
+        LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
+        return LW_NULL;
+    }
+    segment = _LIST_ENTRY(chan->free_seg_list, xilinx_axidma_tx_segment_t, node);
+    _List_Line_Del(&segment->node, &chan->free_seg_list);
+    LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
+
+    lib_bzero(&segment->hw, sizeof(segment->hw));
+    return segment;
+}
+
+/*********************************************************************************************************
+  DMAengine ops 实现
+*********************************************************************************************************/
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_alloc_chan_resources
+** 功能描述: 分配通道资源（预分配描述符段）
+** 输　入  : dchan     - DMA 通道指针
+** 输　出  : 分配的描述符数量；-1 表示失败
+** 全局变量:
+** 调用模块:
 *********************************************************************************************************/
 static INT xilinx_dma_alloc_chan_resources (dma_chan_t *dchan)
 {
     xilinx_dma_chan_t *chan = _LIST_ENTRY(dchan, xilinx_dma_chan_t, common);
+    xilinx_axidma_tx_segment_t *seg_v;
+    phys_addr_t seg_p;
+    INT i;
+
+    if (chan->free_seg_list) {
+        return XILINX_DMA_NUM_DESCS;
+    }
+
+    if (chan->xdev->dma_config->dmatype != XDMA_TYPE_AXIDMA) {
+        printk("[xilinx_dma] alloc_chan_resources: only AXIDMA supported in phase 2\n");
+        return -1;
+    }
+
+    seg_v = (xilinx_axidma_tx_segment_t *)API_VmmDmaAlloc(
+        sizeof(xilinx_axidma_tx_segment_t) * XILINX_DMA_NUM_DESCS);
+    if (!seg_v) {
+        printk("[xilinx_dma] failed to allocate descriptor memory\n");
+        return -1;
+    }
+
+    seg_p = (phys_addr_t)API_VmmGetPhysicalAddr(seg_v);
+
+    chan->cyclic_seg_v = (xilinx_axidma_tx_segment_t *)API_VmmDmaAlloc(
+        sizeof(xilinx_axidma_tx_segment_t));
+    if (!chan->cyclic_seg_v) {
+        printk("[xilinx_dma] failed to allocate cyclic segment\n");
+        API_VmmDmaFree(seg_v);
+        return -1;
+    }
+    chan->cyclic_seg_v->phys = (phys_addr_t)API_VmmGetPhysicalAddr(chan->cyclic_seg_v);
 
     chan->pending_list = LW_NULL;
     chan->active_list  = LW_NULL;
     chan->done_list    = LW_NULL;
+    chan->free_seg_list = LW_NULL;
     chan->idle         = LW_TRUE;
+
+    for (i = 0; i < XILINX_DMA_NUM_DESCS; i++) {
+        seg_v[i].hw.next_desc = (UINT32)((seg_p + sizeof(xilinx_axidma_tx_segment_t) *
+                                ((i + 1) % XILINX_DMA_NUM_DESCS)) & 0xFFFFFFFF);
+        seg_v[i].hw.next_desc_msb = (UINT32)((seg_p + sizeof(xilinx_axidma_tx_segment_t) *
+                                ((i + 1) % XILINX_DMA_NUM_DESCS)) >> 32);
+        seg_v[i].phys = seg_p + i * sizeof(xilinx_axidma_tx_segment_t);
+        _LIST_LINE_INIT_IN_CODE(seg_v[i].node);
+        _List_Line_Add_Tail(&seg_v[i].node, &chan->free_seg_list);
+    }
+
     dma_cookie_init(dchan);
 
-    printk("[xilinx_dma] channel '%s' resources allocated\n", dchan->chan_name);
-    return 0;
+    if (chan->xdev->dma_config->dmatype == XDMA_TYPE_AXIDMA) {
+        UINT32 reg = dma_read(chan, XILINX_DMA_REG_DMACR);
+        reg |= XILINX_DMA_DMACR_ERR_IRQ | XILINX_DMA_DMACR_DLY_CNT_IRQ | XILINX_DMA_DMACR_FRM_CNT_IRQ;
+        dma_write(chan, XILINX_DMA_REG_DMACR, reg);
+    }
+
+    printk("[xilinx_dma] channel '%s' resources allocated (%d segments)\n",
+           dchan->chan_name, XILINX_DMA_NUM_DESCS);
+    return XILINX_DMA_NUM_DESCS;
 }
 
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_free_chan_resources
+** 功能描述: 释放通道资源（清空队列并释放描述符内存）
+** 输　入  : dchan     - DMA 通道指针
+** 输　出  : NONE
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_free_descriptors
+** 功能描述: 释放通道所有描述符
+** 输　入  : chan      - 通道指针
+** 输　出  : NONE
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static VOID xilinx_dma_free_descriptors (xilinx_dma_chan_t *chan)
+{
+    xilinx_dma_tx_descriptor_t *desc, *next;
+    PLW_LIST_LINE pline;
+    INTREG ireg;
+
+    LW_SPIN_LOCK_IRQ(&chan->lock, &ireg);
+
+    while (chan->pending_list) {
+        pline = chan->pending_list;
+        desc = _LIST_ENTRY(pline, xilinx_dma_tx_descriptor_t, async_tx.node);
+        _List_Line_Del(pline, &chan->pending_list);
+        xilinx_dma_free_tx_descriptor(chan, desc);
+    }
+
+    while (chan->active_list) {
+        pline = chan->active_list;
+        desc = _LIST_ENTRY(pline, xilinx_dma_tx_descriptor_t, async_tx.node);
+        _List_Line_Del(pline, &chan->active_list);
+        xilinx_dma_free_tx_descriptor(chan, desc);
+    }
+
+    while (chan->done_list) {
+        pline = chan->done_list;
+        desc = _LIST_ENTRY(pline, xilinx_dma_tx_descriptor_t, async_tx.node);
+        _List_Line_Del(pline, &chan->done_list);
+        xilinx_dma_free_tx_descriptor(chan, desc);
+    }
+
+    LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_free_chan_resources
+** 功能描述: 释放通道资源（清空队列并释放描述符内存）
+** 输　入  : dchan     - DMA 通道指针
+** 输　出  : NONE
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
 static VOID xilinx_dma_free_chan_resources (dma_chan_t *dchan)
 {
+    xilinx_dma_chan_t *chan = _LIST_ENTRY(dchan, xilinx_dma_chan_t, common);
+    INTREG ireg;
+
+    printk("[xilinx_dma] Free all channel resources.\n");
+
+    xilinx_dma_free_descriptors(chan);
+
+    if (chan->xdev->dma_config->dmatype == XDMA_TYPE_AXIDMA) {
+        LW_SPIN_LOCK_IRQ(&chan->lock, &ireg);
+        chan->free_seg_list = LW_NULL;
+        LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
+
+        if (chan->free_seg_list) {
+            xilinx_axidma_tx_segment_t *seg = _LIST_ENTRY(chan->free_seg_list,
+                                                           xilinx_axidma_tx_segment_t, node);
+            API_VmmDmaFree(seg);
+        }
+
+        if (chan->cyclic_seg_v) {
+            API_VmmDmaFree(chan->cyclic_seg_v);
+            chan->cyclic_seg_v = LW_NULL;
+        }
+    }
+
     printk("[xilinx_dma] channel '%s' resources freed\n", dchan->chan_name);
 }
 
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_start_transfer
+** 功能描述: 启动 DMA 传输
+** 输　入  : chan      - 通道指针
+** 输　出  : NONE
+** 全局变量:
+** 调用模块:
+** 注意    : 调用者必须已持有 chan->lock
+*********************************************************************************************************/
+static VOID xilinx_dma_start_transfer (xilinx_dma_chan_t *chan)
+{
+    xilinx_dma_tx_descriptor_t *head_desc, *tail_desc;
+    xilinx_axidma_tx_segment_t *tail_segment;
+    UINT32 reg;
+
+    if (chan->err) {
+        return;
+    }
+
+    if (!chan->pending_list) {
+        return;
+    }
+
+    if (!chan->idle) {
+        return;
+    }
+
+    head_desc = _LIST_ENTRY(chan->pending_list, xilinx_dma_tx_descriptor_t, async_tx.node);
+    tail_desc = _LIST_ENTRY(_list_line_get_last(chan->pending_list),
+                            xilinx_dma_tx_descriptor_t, async_tx.node);
+    tail_segment = _LIST_ENTRY(_list_line_get_last(tail_desc->segments),
+                               xilinx_axidma_tx_segment_t, node);
+
+    reg = dma_read(chan, XILINX_DMA_REG_DMACR);
+
+    if (chan->desc_pendingcount <= XILINX_DMA_COALESCE_MAX) {
+        reg &= ~XILINX_DMA_CR_COALESCE_MAX;
+        reg |= chan->desc_pendingcount << XILINX_DMA_CR_COALESCE_SHIFT;
+        dma_ctrl_write(chan, XILINX_DMA_REG_DMACR, reg);
+    }
+
+    if (chan->has_sg) {
+        dma_write(chan, XILINX_DMA_REG_CURDESC, (UINT32)(head_desc->async_tx.phys & 0xFFFFFFFF));
+        if (chan->xdev->ext_addr) {
+            dma_write(chan, XILINX_DMA_REG_CURDESC_MSB, (UINT32)(head_desc->async_tx.phys >> 32));
+        }
+    }
+
+    reg = dma_read(chan, XILINX_DMA_REG_DMACR);
+    reg |= XILINX_DMA_DMACR_RUNSTOP;
+    dma_write(chan, XILINX_DMA_REG_DMACR, reg);
+
+    if (chan->err) {
+        return;
+    }
+
+    if (chan->has_sg) {
+        if (chan->cyclic) {
+            dma_write(chan, XILINX_DMA_REG_TAILDESC, (UINT32)(chan->cyclic_seg_v->phys & 0xFFFFFFFF));
+            if (chan->xdev->ext_addr) {
+                dma_write(chan, XILINX_DMA_REG_TAILDESC_MSB, (UINT32)(chan->cyclic_seg_v->phys >> 32));
+            }
+        } else {
+            dma_write(chan, XILINX_DMA_REG_TAILDESC, (UINT32)(tail_segment->phys & 0xFFFFFFFF));
+            if (chan->xdev->ext_addr) {
+                dma_write(chan, XILINX_DMA_REG_TAILDESC_MSB, (UINT32)(tail_segment->phys >> 32));
+            }
+        }
+    } else {
+        xilinx_axidma_tx_segment_t *segment;
+        xilinx_axidma_desc_hw_t *hw;
+
+        segment = _LIST_ENTRY(head_desc->segments, xilinx_axidma_tx_segment_t, node);
+        hw = &segment->hw;
+
+        dma_write(chan, XILINX_DMA_REG_SRCDSTADDR, hw->buf_addr);
+        if (chan->xdev->ext_addr) {
+            dma_write(chan, XILINX_DMA_REG_SRCDSTADDR + 4, hw->buf_addr_msb);
+        }
+
+        dma_write(chan, XILINX_DMA_REG_BTT, hw->control & chan->xdev->max_buffer_len);
+    }
+
+    while (chan->pending_list) {
+        PLW_LIST_LINE pline = chan->pending_list;
+        _List_Line_Del(pline, &chan->pending_list);
+        _List_Line_Add_Tail(pline, &chan->active_list);
+    }
+    chan->desc_pendingcount = 0;
+    chan->idle = LW_FALSE;
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_stop_transfer
+** 功能描述: 停止 DMA 传输
+** 输　入  : chan      - 通道指针
+** 输　出  : 0 成功；-1 超时
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static INT xilinx_dma_stop_transfer (xilinx_dma_chan_t *chan)
+{
+    UINT32 reg;
+    INT timeout = XILINX_DMA_LOOP_COUNT;
+
+    reg = dma_read(chan, XILINX_DMA_REG_DMACR);
+    reg &= ~XILINX_DMA_DMACR_RUNSTOP;
+    dma_write(chan, XILINX_DMA_REG_DMACR, reg);
+
+    while (timeout--) {
+        reg = dma_read(chan, XILINX_DMA_REG_DMASR);
+        if (reg & XILINX_DMA_DMASR_HALTED) {
+            chan->idle = LW_TRUE;
+            return 0;
+        }
+    }
+
+    printk("[xilinx_dma] stop timeout, cr %x, sr %x\n",
+           dma_read(chan, XILINX_DMA_REG_DMACR),
+           dma_read(chan, XILINX_DMA_REG_DMASR));
+    return -1;
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_issue_pending
+** 功能描述: 触发待处理传输
+** 输　入  : dchan     - DMA 通道指针
+** 输　出  : NONE
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
 static VOID xilinx_dma_issue_pending (dma_chan_t *dchan)
 {
-    printk("[xilinx_dma] issue_pending called on '%s'\n", dchan->chan_name);
+    xilinx_dma_chan_t *chan = _LIST_ENTRY(dchan, xilinx_dma_chan_t, common);
+    INTREG ireg;
+
+    LW_SPIN_LOCK_IRQ(&chan->lock, &ireg);
+    if (chan->start_transfer) {
+        chan->start_transfer(chan);
+    }
+    LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
 }
 
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_tx_status
+** 功能描述: 查询传输状态
+** 输　入  : dchan     - DMA 通道指针
+**           cookie    - 传输 cookie
+**           txstate   - 状态输出指针
+** 输　出  : 传输状态
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
 static dma_status_t xilinx_dma_tx_status (dma_chan_t *dchan, dma_cookie_t cookie, dma_tx_state_t *txstate)
 {
-    return dma_cookie_status(dchan, cookie, txstate);
+    xilinx_dma_chan_t *chan = _LIST_ENTRY(dchan, xilinx_dma_chan_t, common);
+    xilinx_dma_tx_descriptor_t *desc;
+    dma_status_t ret;
+    UINT32 residue = 0;
+    INTREG ireg;
+
+    ret = dma_cookie_status(dchan, cookie, txstate);
+    if (ret == DMA_COMPLETE || !txstate) {
+        return ret;
+    }
+
+    LW_SPIN_LOCK_IRQ(&chan->lock, &ireg);
+
+    /*  计算 residue：遍历 active 队列中匹配 cookie 的描述符  */
+    PLW_LIST_LINE pline = chan->active_list;
+    while (pline) {
+        desc = _LIST_ENTRY(pline, xilinx_dma_tx_descriptor_t, async_tx.node);
+        if (desc->async_tx.cookie == cookie) {
+            /*  累加所有段的长度  */
+            PLW_LIST_LINE seg_line = desc->segments;
+            while (seg_line) {
+                xilinx_axidma_tx_segment_t *seg = _LIST_ENTRY(seg_line, xilinx_axidma_tx_segment_t, node);
+                residue += seg->hw.control & chan->xdev->max_buffer_len;
+                seg_line = _list_line_get_next(seg_line);
+            }
+            break;
+        }
+        pline = _list_line_get_next(pline);
+    }
+
+    LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
+
+    txstate->residue = residue;
+    return ret;
 }
 
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_slave_config
+** 功能描述: 配置 Slave 通道参数
+** 输　入  : dchan     - DMA 通道指针
+**           config    - 配置参数指针
+** 输　出  : 0 成功；-1 失败
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
 static INT xilinx_dma_slave_config (dma_chan_t *dchan, dma_slave_config_t *config)
 {
     xilinx_dma_chan_t *chan = _LIST_ENTRY(dchan, xilinx_dma_chan_t, common);
@@ -348,19 +834,373 @@ static INT xilinx_dma_slave_config (dma_chan_t *dchan, dma_slave_config_t *confi
         return -1;
     }
 
+    if (config->direction != DMA_MEM_TO_DEV && config->direction != DMA_DEV_TO_MEM) {
+        return -1;
+    }
+
     chan->slave_cfg = *config;
     printk("[xilinx_dma] channel '%s' configured\n", dchan->chan_name);
     return 0;
 }
 
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_terminate_all
+** 功能描述: 终止所有传输并清空队列
+** 输　入  : dchan     - DMA 通道指针
+** 输　出  : 0 成功
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
 static INT xilinx_dma_terminate_all (dma_chan_t *dchan)
 {
-    printk("[xilinx_dma] terminate_all called on '%s'\n", dchan->chan_name);
+    xilinx_dma_chan_t *chan = _LIST_ENTRY(dchan, xilinx_dma_chan_t, common);
+    UINT32 reg;
+    INT err;
+
+    if (!chan->cyclic && chan->stop_transfer) {
+        err = chan->stop_transfer(chan);
+        if (err) {
+            printk("[xilinx_dma] Cannot stop channel %p: %x\n",
+                   chan, dma_read(chan, XILINX_DMA_REG_DMASR));
+            chan->err = LW_TRUE;
+        }
+    }
+
+    chan->terminating = LW_TRUE;
+    xilinx_dma_free_descriptors(chan);
+    chan->idle = LW_TRUE;
+
+    if (chan->cyclic) {
+        reg = dma_read(chan, XILINX_DMA_REG_DMACR);
+        reg &= ~XILINX_DMA_CR_CYCLIC_BD_EN_MASK;
+        dma_write(chan, XILINX_DMA_REG_DMACR, reg);
+        chan->cyclic = LW_FALSE;
+    }
+
     return 0;
 }
 
 /*********************************************************************************************************
-** 函数名称: xilinx_dma_chan_probe
+** 函数名称: xilinx_dma_prep_slave_sg
+** 功能描述: 准备 Slave SG 传输
+** 输　入  : dchan     - DMA 通道指针
+**           sgl       - SG 条目数组
+**           sg_len    - SG 条目数量
+**           direction - 传输方向
+**           flags     - 标志位
+**           context   - 上下文指针
+** 输　出  : 描述符指针；LW_NULL 表示失败
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static dma_async_tx_descriptor_t *xilinx_dma_prep_slave_sg (
+    dma_chan_t *dchan, dma_sg_entry_t *sgl, UINT sg_len,
+    dma_transfer_direction_t direction, ULONG flags, PVOID context)
+{
+    xilinx_dma_chan_t *chan = _LIST_ENTRY(dchan, xilinx_dma_chan_t, common);
+    xilinx_dma_tx_descriptor_t *desc;
+    xilinx_axidma_tx_segment_t *segment, *prev = LW_NULL;
+    UINT32 *app_w = (UINT32 *)context;
+    phys_addr_t buf_addr;
+    UINT i;
+
+    if (direction != DMA_MEM_TO_DEV && direction != DMA_DEV_TO_MEM) {
+        return LW_NULL;
+    }
+
+    if (chan->xdev->dma_config->dmatype != XDMA_TYPE_AXIDMA) {
+        return LW_NULL;
+    }
+
+    if (!sgl || sg_len == 0) {
+        return LW_NULL;
+    }
+
+    desc = xilinx_dma_alloc_tx_descriptor(chan);
+    if (!desc) {
+        return LW_NULL;
+    }
+
+    for (i = 0; i < sg_len; i++) {
+        segment = xilinx_axidma_alloc_tx_segment(chan);
+        if (!segment) {
+            xilinx_dma_free_tx_descriptor(chan, desc);
+            return LW_NULL;
+        }
+
+        buf_addr = sgl[i].addr;
+        segment->hw.buf_addr = (UINT32)(buf_addr & 0xFFFFFFFF);
+        if (chan->xdev->ext_addr) {
+            segment->hw.buf_addr_msb = (UINT32)(buf_addr >> 32);
+        }
+
+        segment->hw.control = sgl[i].len & chan->xdev->max_buffer_len;
+
+        if (chan->direction == DMA_MEM_TO_DEV && app_w) {
+            lib_memcpy(segment->hw.app, app_w, sizeof(UINT32) * XILINX_DMA_NUM_APP_WORDS);
+        }
+
+        if (prev) {
+            prev->hw.next_desc = (UINT32)(segment->phys & 0xFFFFFFFF);
+            if (chan->xdev->ext_addr) {
+                prev->hw.next_desc_msb = (UINT32)(segment->phys >> 32);
+            }
+            API_CacheClear(DATA_CACHE, prev, sizeof(xilinx_axidma_tx_segment_t));
+        }
+
+        _List_Line_Add_Tail(&segment->node, &desc->segments);
+        prev = segment;
+    }
+
+    segment = _LIST_ENTRY(desc->segments, xilinx_axidma_tx_segment_t, node);
+    desc->async_tx.phys = segment->phys;
+
+    if (chan->direction == DMA_MEM_TO_DEV) {
+        segment->hw.control |= XILINX_DMA_BD_SOP;
+        segment = _LIST_ENTRY(_list_line_get_last(desc->segments),
+                              xilinx_axidma_tx_segment_t, node);
+        segment->hw.control |= XILINX_DMA_BD_EOP;
+    }
+
+    desc->async_tx.chan = dchan;
+    desc->async_tx.flags = flags;
+    desc->async_tx.tx_submit = xilinx_dma_tx_submit;
+    return &desc->async_tx;
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_prep_dma_memcpy
+** 功能描述: 准备内存拷贝传输（CDMA）
+** 输　入  : dchan     - DMA 通道指针
+**           dst       - 目标地址
+**           src       - 源地址
+**           len       - 传输长度
+**           flags     - 标志位
+** 输　出  : 描述符指针；LW_NULL 表示失败
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static dma_async_tx_descriptor_t *xilinx_dma_prep_dma_memcpy (
+    dma_chan_t *dchan, phys_addr_t dst, phys_addr_t src, size_t len, ULONG flags)
+{
+    xilinx_dma_chan_t *chan = _LIST_ENTRY(dchan, xilinx_dma_chan_t, common);
+    xilinx_dma_tx_descriptor_t *desc;
+    xilinx_axidma_tx_segment_t *segment;
+
+    if (!len || len > chan->xdev->max_buffer_len) {
+        return LW_NULL;
+    }
+
+    desc = xilinx_dma_alloc_tx_descriptor(chan);
+    if (!desc) {
+        return LW_NULL;
+    }
+
+    segment = xilinx_axidma_alloc_tx_segment(chan);
+    if (!segment) {
+        xilinx_dma_free_tx_descriptor(chan, desc);
+        return LW_NULL;
+    }
+
+    segment->hw.buf_addr = (UINT32)(src & 0xFFFFFFFF);
+    if (chan->xdev->ext_addr) {
+        segment->hw.buf_addr_msb = (UINT32)(src >> 32);
+    }
+
+    segment->hw.control = (len & chan->xdev->max_buffer_len) | XILINX_DMA_BD_SOP | XILINX_DMA_BD_EOP;
+    segment->hw.next_desc = 0;
+    segment->hw.next_desc_msb = 0;
+
+    _List_Line_Add_Tail(&segment->node, &desc->segments);
+
+    desc->async_tx.phys = segment->phys;
+    desc->async_tx.chan = dchan;
+    desc->async_tx.flags = flags;
+    desc->async_tx.tx_submit = xilinx_dma_tx_submit;
+    return &desc->async_tx;
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_tx_submit
+** 功能描述: 提交传输描述符
+** 输　入  : tx        - 传输描述符指针
+** 输　出  : cookie 值
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static dma_cookie_t xilinx_dma_tx_submit (dma_async_tx_descriptor_t *tx)
+{
+    xilinx_dma_tx_descriptor_t *desc = _LIST_ENTRY(tx, xilinx_dma_tx_descriptor_t, async_tx);
+    xilinx_dma_chan_t *chan = _LIST_ENTRY(tx->chan, xilinx_dma_chan_t, common);
+    dma_cookie_t cookie;
+    INTREG ireg;
+
+    LW_SPIN_LOCK_IRQ(&chan->lock, &ireg);
+    cookie = dma_cookie_assign(tx);
+    _List_Line_Add_Tail(&tx->node, &chan->pending_list);
+    chan->terminating = LW_FALSE;
+    LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
+
+    return cookie;
+}
+
+/*********************************************************************************************************
+  中断处理
+*********************************************************************************************************/
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_complete_descriptor
+** 功能描述: 将 active 描述符移到 done 队列
+** 输　入  : chan      - 通道指针
+** 输　出  : NONE
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static VOID xilinx_dma_complete_descriptor (xilinx_dma_chan_t *chan)
+{
+    xilinx_dma_tx_descriptor_t *desc, *next;
+
+    if (!chan->active_list) {
+        return;
+    }
+
+    while (chan->active_list) {
+        desc = _LIST_ENTRY(chan->active_list, xilinx_dma_tx_descriptor_t, async_tx.node);
+        desc->err = chan->err;
+        _List_Line_Del(&desc->async_tx.node, &chan->active_list);
+        if (!desc->cyclic) {
+            dma_cookie_complete(&desc->async_tx);
+        }
+        _List_Line_Add_Tail(&desc->async_tx.node, &chan->done_list);
+    }
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_chan_desc_cleanup
+** 功能描述: 清理已完成的描述符并调用回调
+** 输　入  : chan      - 通道指针
+** 输　出  : NONE
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static VOID xilinx_dma_chan_desc_cleanup (xilinx_dma_chan_t *chan)
+{
+    xilinx_dma_tx_descriptor_t *desc;
+    dma_async_tx_descriptor_callback_result_t cb;
+    PVOID cb_param;
+    dmaengine_result_t result;
+    INTREG ireg;
+
+    LW_SPIN_LOCK_IRQ(&chan->lock, &ireg);
+
+    while (chan->done_list) {
+        desc = _LIST_ENTRY(chan->done_list, xilinx_dma_tx_descriptor_t, async_tx.node);
+        _List_Line_Del(&desc->async_tx.node, &chan->done_list);
+
+        cb = desc->async_tx.callback_result;
+        cb_param = desc->async_tx.callback_param;
+
+        dma_cookie_complete(&desc->async_tx);
+
+        LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
+
+        if (cb) {
+            result.result = desc->err ? DMA_TRANS_ABORTED : DMA_TRANS_NOERROR;
+            result.residue = desc->residue;
+            cb(cb_param, &result);
+        }
+
+        LW_SPIN_LOCK_IRQ(&chan->lock, &ireg);
+        xilinx_dma_free_tx_descriptor(chan, desc);
+
+        if (chan->terminating)
+            break;
+    }
+
+    LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_do_tasklet
+** 功能描述: 中断底半部处理
+** 输　入  : arg       - 通道指针
+** 输　出  : NONE
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static VOID xilinx_dma_do_tasklet (PVOID arg)
+{
+    xilinx_dma_chan_t *chan = (xilinx_dma_chan_t *)arg;
+    INTREG ireg;
+
+    xilinx_dma_chan_desc_cleanup(chan);
+
+    /*  如果有 pending 且通道空闲，启动新传输  */
+    LW_SPIN_LOCK_IRQ(&chan->lock, &ireg);
+    if (chan->idle && chan->pending_list && chan->start_transfer && !chan->err) {
+        chan->start_transfer(chan);
+    }
+    LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_irq_handler
+** 功能描述: DMA 中断处理函数
+** 输　入  : data      - 通道指针
+**           vector    - 中断向量
+** 输　出  : LW_IRQ_HANDLED 或 LW_IRQ_NONE
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static irqreturn_t xilinx_dma_irq_handler (PVOID data, ULONG vector)
+{
+    xilinx_dma_chan_t *chan = (xilinx_dma_chan_t *)data;
+    UINT32 status;
+    INTREG ireg;
+
+    status = dma_read(chan, XILINX_DMA_REG_DMASR);
+
+    if (!(status & XILINX_DMA_DMAXR_ALL_IRQ_MASK)) {
+        return LW_IRQ_NONE;
+    }
+
+    /*  清除中断标志  */
+    dma_write(chan, XILINX_DMA_REG_DMASR, status & XILINX_DMA_DMAXR_ALL_IRQ_MASK);
+
+    if (status & XILINX_DMA_DMASR_ERR_IRQ) {
+        UINT32 errors = status & XILINX_DMA_DMASR_ALL_ERR_MASK;
+
+        dma_write(chan, XILINX_DMA_REG_DMASR, errors & XILINX_DMA_DMASR_ERR_RECOVER_MASK);
+
+        if (errors & ~XILINX_DMA_DMASR_ERR_RECOVER_MASK) {
+            printk("[xilinx_dma] Channel %p has errors %x, cdr %x tdr %x\n",
+                   chan, errors,
+                   dma_read(chan, XILINX_DMA_REG_CURDESC),
+                   dma_read(chan, XILINX_DMA_REG_TAILDESC));
+            chan->err = LW_TRUE;
+        }
+    }
+
+    if (status & XILINX_DMA_DMASR_DLY_CNT_IRQ) {
+        /* Device takes too long */
+    }
+
+    if (status & XILINX_DMA_DMASR_FRM_CNT_IRQ) {
+        LW_SPIN_LOCK(&chan->lock, &ireg);
+        xilinx_dma_complete_descriptor(chan);
+        chan->idle = LW_TRUE;
+        if (chan->start_transfer) {
+            chan->start_transfer(chan);
+        }
+        LW_SPIN_UNLOCK(&chan->lock, ireg);
+    }
+
+    API_InterDeferJobAdd(chan->defer_job, xilinx_dma_do_tasklet, chan);
+
+    return LW_IRQ_HANDLED;
+}
+
+/*********************************************************************************************************
 ** 功能描述: 通道 probe（创建并初始化单个通道）
 ** 输　入  : xdev      - 设备指针
 **           child_idx - 子节点索引
@@ -399,6 +1239,7 @@ static INT xilinx_dma_chan_probe (xilinx_dma_device_t *xdev, INT child_idx, INT 
     chan->cyclic      = LW_FALSE;
     chan->err         = LW_FALSE;
     chan->idle        = LW_TRUE;
+    chan->terminating = LW_FALSE;
 
     LW_SPIN_INIT(&chan->lock);
     chan->pending_list   = LW_NULL;
@@ -408,8 +1249,25 @@ static INT xilinx_dma_chan_probe (xilinx_dma_device_t *xdev, INT child_idx, INT 
 
     lib_bzero(&chan->slave_cfg, sizeof(dma_slave_config_t));
 
-    chan->start_transfer = LW_NULL;
-    chan->stop_transfer  = LW_NULL;
+    if (xdev->dma_config->dmatype == XDMA_TYPE_AXIDMA) {
+        chan->start_transfer = xilinx_dma_start_transfer;
+        chan->stop_transfer  = xilinx_dma_stop_transfer;
+    } else {
+        chan->start_transfer = LW_NULL;
+        chan->stop_transfer  = LW_NULL;
+    }
+
+    chan->defer_job = API_InterDeferGet(0);
+
+    if (irq > 0) {
+        {
+            #define IRQ_TYPE_LEVEL_HIGH             (0x00000004)
+            extern VOID  bspIntVectorTypeSet(ULONG  ulVector, INT  iType);
+            bspIntVectorTypeSet(irq, IRQ_TYPE_LEVEL_HIGH);
+        }
+        API_InterVectorConnect(irq, xilinx_dma_irq_handler, chan, "xilinx-dma");
+        API_InterVectorEnable(irq);
+    }
 
     chan->common.device = &xdev->common;
     snprintf(chan->common.chan_name, sizeof(chan->common.chan_name),
@@ -541,6 +1399,8 @@ INT  xilinx_dma_params_register (const xilinx_board_params_t *params)
 
     xdev->common.device_alloc_chan_resources = xilinx_dma_alloc_chan_resources;
     xdev->common.device_free_chan_resources  = xilinx_dma_free_chan_resources;
+    xdev->common.device_prep_slave_sg        = xilinx_dma_prep_slave_sg;
+    xdev->common.device_prep_dma_memcpy      = xilinx_dma_prep_dma_memcpy;
     xdev->common.device_issue_pending        = xilinx_dma_issue_pending;
     xdev->common.device_tx_status            = xilinx_dma_tx_status;
     xdev->common.device_config               = xilinx_dma_slave_config;

@@ -678,6 +678,48 @@ INT xilinx_dma_chan_probe(xilinx_dma_device_t *xdev,
 - 头文件仅放置对外暴露的必要接口，数据结构，声明等内容放到要用的源文件中
 - 待定
 
+**SylixOS 注释风格规范**:
+
+1. **文件头注释**: 包含组织、系统、版权、文件信息、创建人、日期、功能描述
+2. **函数注释**: 使用标准格式，包含函数名称、功能描述、输入、输出、全局变量、调用模块、注意事项
+3. **代码段注释**: 使用 `/*********************************************************************************************************` 分隔不同功能模块
+4. **行内注释**: 使用 `/*  注释内容  */` 格式，注意空格
+
+**注释检查结果**:
+
+已完成的函数注释（符合 SylixOS 标准）:
+
+- ✅ xilinx_dma_alloc_tx_descriptor: 完整函数注释
+- ✅ xilinx_dma_set_coalesce: 完整函数注释
+- ✅ xilinx_dma_free_tx_descriptor: 完整函数注释
+- ✅ xilinx_axidma_alloc_tx_segment: 完整函数注释（已添加注意事项）
+- ✅ xilinx_dma_alloc_chan_resources: 完整函数注释
+- ✅ xilinx_dma_start_transfer: 完整函数注释（含注意事项）
+- ✅ xilinx_dma_stop_transfer: 完整函数注释
+- ✅ xilinx_dma_issue_pending: 完整函数注释
+- ✅ xilinx_dma_tx_status: 完整函数注释
+- ✅ xilinx_dma_slave_config: 完整函数注释
+- ✅ xilinx_dma_terminate_all: 完整函数注释
+- ✅ xilinx_dma_prep_slave_sg: 完整函数注释
+- ✅ xilinx_dma_prep_dma_memcpy: 完整函数注释
+- ✅ xilinx_dma_tx_submit: 完整函数注释
+- ✅ xilinx_dma_complete_descriptor: 完整函数注释
+- ✅ xilinx_dma_chan_desc_cleanup: 完整函数注释
+- ✅ xilinx_dma_do_tasklet: 完整函数注释
+- ✅ xilinx_dma_irq_handler: 完整函数注释
+
+已修复的注释（新增标准格式）:
+
+- ✅ dma_read: 新增完整函数注释
+- ✅ dma_write: 新增完整函数注释
+- ✅ xilinx_match_config: 新增完整函数注释
+
+**代码内注释规范**:
+
+- 使用 `/*  注释内容  */` 格式，前后各一个空格
+- 关键逻辑处添加注释说明
+- 示例: `/*  清除中断标志  */`、`/*  如果有 pending 且通道空闲，启动新传输  */`
+
 #### 7.4.1 寄存器映射
 
 **错误做法**:
@@ -798,7 +840,68 @@ static irqreturn_t xilinx_dma_irq_handler(PVOID data, ULONG vector)
 4. 优化通道ID分配逻辑，避免ID空洞
 5. 移除alloc_chan_resources中的重复锁初始化
 
-**阶段2**: AXI DMA实现(10天)
+**阶段2**: AXI DMA实现(10天) ✅ **已完成并优化**
+
+- ✅ 描述符内存管理
+  - xilinx_dma_alloc_tx_descriptor: 分配软件描述符
+  - xilinx_dma_free_tx_descriptor: 释放描述符并归还段到free_seg_list
+  - xilinx_axidma_alloc_tx_segment: 从free_seg_list获取段
+  - 预分配255个描述符段，使用DMA一致性内存
+- ✅ SG模式传输 (device_prep_slave_sg)
+  - 遍历scatterlist构建硬件描述符链
+  - 设置buf_addr、control字段（包含长度和SOP/EOP标志）
+  - 支持64位地址扩展
+  - 硬件描述符通过next_desc形成物理链表
+  - **优化**: 添加参数校验、缓存刷新、next_desc清零
+- ✅ Simple模式传输 (device_prep_dma_memcpy)
+  - 单段传输，同时设置SOP和EOP
+  - 用于内存到内存拷贝
+  - **优化**: 添加长度校验、缓存刷新
+- ✅ 传输启动 (start_transfer)
+  - 一次性处理整个pending队列
+  - 将多个描述符链接成一条硬件链
+  - 防止DMA运行时喂TAILDESC
+  - **优化**: 消除重复遍历、添加缓存刷新和内存屏障
+- ✅ 中断处理
+  - xilinx_dma_irq_handler: 硬中断处理，只做最少工作
+  - 检测错误中断并立即停止DMA
+  - 批量移动active到done队列
+  - **优化**: 在底半部启动新传输，避免中断延迟
+- ✅ 底半部处理 (xilinx_dma_do_tasklet)
+  - xilinx_dma_chan_desc_cleanup: 遍历done_list
+  - 调用用户回调函数callback_result
+  - 释放描述符并归还段到free_seg_list
+  - 检查并启动新传输
+- ✅ 传输停止 (stop_transfer)
+  - 清除DMACR.RUNSTOP位
+  - 轮询DMASR.HALTED状态确认停止
+  - 超时1秒
+- ✅ 终止所有传输 (terminate_all)
+  - 调用stop_transfer停止硬件
+  - 清空pending_list和active_list
+  - 释放所有未完成的描述符
+- ✅ 资源管理完善
+  - alloc_chan_resources: 预分配255个段，初始化free_seg_list，启用中断合并
+  - free_chan_resources: 清空所有队列，释放DMA内存
+- ✅ tx_submit实现
+  - 分配cookie并加入pending_list
+  - 在每个prep函数中设置desc->async_tx.tx_submit
+- ✅ 中断合并支持
+  - xilinx_dma_set_coalesce: 配置帧计数和延迟计数
+  - 默认启用(1帧/1延迟)
+- ✅ Residue计算
+  - 遍历active队列累加段长度
+  - 支持传输进度查询
+- ✅ Slave配置校验
+  - 检查direction参数有效性
+
+**关键优化**:
+- 消除重复链表遍历，提升性能
+- 添加缓存刷新和内存屏障，确保DMA一致性
+- 中断上下文保持简洁，重量级操作在底半部执行
+- 完善参数校验，提高健壮性
+
+**阶段3**: 其他IP类型(14天)
 
 - Simple模式传输
 - SG模式传输
