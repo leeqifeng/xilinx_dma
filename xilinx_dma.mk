@@ -36,6 +36,7 @@ LOCAL_SRCS :=  \
 src/dma.c \
 src/dmaengine.c \
 src/hw/demoip/demoip.c \
+src/hw/xilinx/xilinx.c \
 src/test/dma_test.c
 
 #*********************************************************************************************************
