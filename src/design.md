@@ -14,13 +14,13 @@
 
 ```text
 src/
-├── dma.c                   内核模块入口（module_init / module_exit）
+├── dma.c                   内核模块入口（module_init / module_exit），包含用户静态板级配置，如ip厂家，型号等信息
 ├── dmaengine.h             框架核心头文件（数据结构 + 公开 API + inline helpers）
 ├── dmaengine.c             框架核心实现（全局设备链表管理、通道调度、状态查询）
 ├── os_common.h             操作系统提供的接口示例，因代码量过大，这里只是一部分接口示例（实际工程中包含sylixos.h，不存在os_common.h）
 ├── hw/
 │   └── demoip/
-│       ├── demoip.h        Demo IP 驱动公开头文件
+│       ├── demoip.h        Demo IP 初始化声明，不包含驱动相关信息
 │       └── demoip.c        Demo IP 纯软件模拟 DMA 驱动（memcpy + Slave SG，移植参考模板）
 └── test/
     └── dma_test.c          tshell 测试套件（5 个命令，含 BER 误码率统计）
@@ -208,14 +208,15 @@ static const demoip_board_params_t _G_demoip_board_params = {
 **调用链**：
 
 ```text
-demoip_driver_init()
-  └─ __demoip_probe(&_G_demoip_board_params)
-       ├─ 打印板级资源信息（compatible / reg / irq / nr_channels）
-       ├─ 【真实硬件】映射寄存器：API_VmmMap(reg_base, reg_size)
-       ├─ 【真实硬件】注册中断：API_InterVectorConnect(irq, isr_fn, ...)
-       ├─ 填充 dma_device_t.ops
-       ├─ 按 nr_channels 挂入通道链表
-       └─ dma_async_device_register(dev)
+├─  (manufacturers.h):manufacturers_driver_init()
+└─  (demoip.h):demoip_driver_init()
+    └─ __(demoip.c):demoip_probe(&_G_demoip_board_params)
+        ├─ 打印板级资源信息（compatible / reg / irq / nr_channels）
+        ├─ 【真实硬件】映射寄存器：API_VmmMap(reg_base, reg_size)
+        ├─ 【真实硬件】注册中断：API_InterVectorConnect(irq, isr_fn, ...)
+        ├─ 填充 dma_device_t.ops
+        ├─ 按 nr_channels 挂入通道链表
+        └─ dma_async_device_register(dev)
 ```
 
 **移植为真实硬件驱动的步骤**：

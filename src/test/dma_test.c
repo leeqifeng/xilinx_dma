@@ -42,7 +42,9 @@
 **    dma_test_multi       [count] [entry]           批量多描述符 + dma_sync_wait（默认 8×512B，ch1），输出 BER
 **    dma_test_sg          [sg] [entry] [rx|tx]      单向 Slave SG 传输（默认 4×512B rx，ch0），输出 BER
 **    dma_test_loopback_fd [sg] [entry] [rounds]     全双工回环：TX ∥ RX 并发（默认 4×512B×1），累计 TX/RX BER
-**    dma_test_perf        [duration_sec]            全场景性能基准（15 种配置，每场景计时运行）
+**                                                   - 测试目的：端到端全双工可用带宽（2 通道同时工作）
+**    dma_test_perf        [duration_sec]            单通道极限带宽基准（15 种配置，每场景计时运行）
+**                                                   - 测试目的：单通道理论峰值吞吐（1 通道独占 CPU）
 **                                                   - 每秒输出中间吞吐报告
 **                                                   - 场景结束输出单场景摘要（含 errors=N）
 **                                                   - 全部完成后输出汇总表（失败场景追加 [err=N]）
@@ -79,6 +81,14 @@ typedef struct {
     UINT32              residue;
 } dma_completion_t;
 
+/*********************************************************************************************************
+** 函数名称: __dma_complete_cb
+** 功能描述: 单路传输完成回调（记录状态并 post 信号量）
+** 输　入  : param  — dma_completion_t 指针
+**           result — 传输结果
+** 输　出  : NONE
+*********************************************************************************************************/
+
 static VOID  __dma_complete_cb (PVOID param, const dmaengine_result_t *result)
 {
     dma_completion_t  *comp = (dma_completion_t *)param;
@@ -86,6 +96,13 @@ static VOID  __dma_complete_cb (PVOID param, const dmaengine_result_t *result)
     comp->residue = result->residue;
     API_SemaphoreBPost(comp->sem);
 }
+
+/*********************************************************************************************************
+** 函数名称: __dma_completion_init
+** 功能描述: 初始化单路完成等待结构（创建信号量）
+** 输　入  : comp — 完成等待结构指针
+** 输　出  : 0 成功；-1 失败
+*********************************************************************************************************/
 
 static INT  __dma_completion_init (dma_completion_t *comp)
 {
@@ -95,6 +112,13 @@ static INT  __dma_completion_init (dma_completion_t *comp)
     comp->status = DMA_IN_PROGRESS;
     return  (0);
 }
+
+/*********************************************************************************************************
+** 函数名称: __dma_completion_destroy
+** 功能描述: 销毁单路完成等待结构（删除信号量）
+** 输　入  : comp — 完成等待结构指针
+** 输　出  : NONE
+*********************************************************************************************************/
 
 static VOID  __dma_completion_destroy (dma_completion_t *comp)
 {
@@ -156,6 +180,14 @@ typedef struct {
     dma_status_t      status_b;    /*  通道 B 完成状态（cb_b 填写）                     */
 } dma_pair_sync_t;
 
+/*********************************************************************************************************
+** 函数名称: __dma_pair_cb_a
+** 功能描述: 通道 A 完成回调（屏障计数递减，最后完成者 post 信号量）
+** 输　入  : param  — dma_pair_sync_t 指针
+**           result — 传输结果
+** 输　出  : NONE
+*********************************************************************************************************/
+
 static VOID  __dma_pair_cb_a (PVOID param, const dmaengine_result_t *result)
 {
     dma_pair_sync_t  *sync = (dma_pair_sync_t *)param;
@@ -170,6 +202,14 @@ static VOID  __dma_pair_cb_a (PVOID param, const dmaengine_result_t *result)
         LW_SPIN_UNLOCK_IRQ(&sync->lock, ireg);
     }
 }
+
+/*********************************************************************************************************
+** 函数名称: __dma_pair_cb_b
+** 功能描述: 通道 B 完成回调（屏障计数递减，最后完成者 post 信号量）
+** 输　入  : param  — dma_pair_sync_t 指针
+**           result — 传输结果
+** 输　出  : NONE
+*********************************************************************************************************/
 
 static VOID  __dma_pair_cb_b (PVOID param, const dmaengine_result_t *result)
 {
@@ -186,6 +226,14 @@ static VOID  __dma_pair_cb_b (PVOID param, const dmaengine_result_t *result)
     }
 }
 
+/*********************************************************************************************************
+** 函数名称: __dma_pair_sync_init
+** 功能描述: 初始化全双工同步屏障（创建共享信号量、初始化自旋锁）
+** 输　入  : sync — 同步屏障结构指针
+** 输　出  : 0 成功；-1 失败
+** 说明    : 调用方在循环外初始化一次，循环内通过 __dma_exec_pair 复用，避免每轮创建/销毁开销
+*********************************************************************************************************/
+
 static INT  __dma_pair_sync_init (dma_pair_sync_t *sync)
 {
     lib_memset(sync, 0, sizeof(*sync));
@@ -194,6 +242,13 @@ static INT  __dma_pair_sync_init (dma_pair_sync_t *sync)
     if (sync->sem == LW_OBJECT_HANDLE_INVALID) { return  (-1); }
     return  (0);
 }
+
+/*********************************************************************************************************
+** 函数名称: __dma_pair_sync_destroy
+** 功能描述: 销毁全双工同步屏障（删除共享信号量）
+** 输　入  : sync — 同步屏障结构指针
+** 输　出  : NONE
+*********************************************************************************************************/
 
 static VOID  __dma_pair_sync_destroy (dma_pair_sync_t *sync)
 {
@@ -292,6 +347,15 @@ static INT  __dma_slave_cfg (dma_chan_t *chan, dma_transfer_direction_t dir, PVO
     }
     return  dmaengine_slave_config(chan, &cfg);
 }
+
+/*********************************************************************************************************
+** 函数名称: __print_throughput
+** 功能描述: 格式化输出吞吐量（自动选择 KB/s 或 MB/s 单位）
+** 输　入  : bytes — 传输字节数
+**           ticks — 耗时 tick 数
+** 输　出  : NONE
+** 说明    : ticks=0 时输出 N/A；≥1024 KB/s 时显示 MB/s（小数点后 1 位）
+*********************************************************************************************************/
 
 static VOID  __print_throughput (UINT64 bytes, UINT64 ticks)
 {
@@ -763,7 +827,7 @@ static const dma_perf_scenario_t  _G_perf_scenarios[] = {
     // { "nic-tx  ETH  SG=3",   DMA_SLAVE,  DMA_MEM_TO_DEV, 3,      500 },
     // { "nic-tx  Jmbo SG=8",   DMA_SLAVE,  DMA_MEM_TO_DEV, 8,     1125 },
     // { "blk-rd  512B  sect",  DMA_SLAVE,  DMA_DEV_TO_MEM, 1,      512 },
-    // { "blk-rd   4KB  page",  DMA_SLAVE,  DMA_DEV_TO_MEM, 1,     4096 },
+    { "blk-rd   4KB  page",  DMA_SLAVE,  DMA_DEV_TO_MEM, 1,     4096 },
     // { "blk-rd 128KB  seq",   DMA_SLAVE,  DMA_DEV_TO_MEM, 1,   131072 },
     // { "blk-rd 512KB  large", DMA_SLAVE,  DMA_DEV_TO_MEM, 1,   524288 },
     // { "blk-wr   4KB  page",  DMA_SLAVE,  DMA_MEM_TO_DEV, 1,     4096 },
