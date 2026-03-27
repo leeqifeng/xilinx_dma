@@ -40,6 +40,9 @@
 #include "../../dmaengine.h"
 #include "xilinx.h"
 
+#define IRQ_TYPE_LEVEL_HIGH             (0x00000004)
+extern VOID  bspIntVectorTypeSet(ULONG ulVector, INT iType);
+
 /*********************************************************************************************************
   寄存器偏移定义
 *********************************************************************************************************/
@@ -109,7 +112,7 @@
 #define GENMASK(h, l) \
     (((~0UL) - (1UL << (l)) + 1) & (~0UL >> (31 - (h))))
 
-#define XILINX_DMA_LOOP_COUNT               1000000
+#define XILINX_DMA_LOOP_COUNT               1000000         /*  轮询超时计数（约1秒 @ 1MHz）*/
 #define XILINX_DMA_MAX_CHANS_PER_DEVICE     2
 #define XILINX_CDMA_MAX_CHANS_PER_DEVICE    1
 #define XILINX_MCDMA_MAX_CHANS_PER_DEVICE   32
@@ -121,6 +124,11 @@
 #define XILINX_DMA_DELAY_MAX                255
 #define XILINX_DMA_CR_COALESCE_MAX          GENMASK(23, 16)
 #define XILINX_DMA_CR_COALESCE_SHIFT        16
+
+/*********************************************************************************************************
+  调试开关
+*********************************************************************************************************/
+// #define XILINX_DMA_DEBUG                    1
 
 /*********************************************************************************************************
   IP 类型枚举
@@ -220,6 +228,8 @@ typedef struct xilinx_vdma_tx_segment {
 *********************************************************************************************************/
 typedef struct xilinx_dma_tx_descriptor {
     dma_async_tx_descriptor_t  async_tx;
+    phys_addr_t                phys;                                    /*  链表头段的物理地址          */
+    phys_addr_t                tail_phys;                               /*  链表尾段的物理地址          */
     PLW_LIST_LINE              segments;
     BOOL                       cyclic;
     BOOL                       err;
@@ -231,6 +241,30 @@ typedef struct xilinx_dma_tx_descriptor {
 *********************************************************************************************************/
 struct xilinx_dma_device;
 struct xilinx_dma_chan;
+
+static dma_cookie_t xilinx_dma_tx_submit (dma_async_tx_descriptor_t *tx);
+static INT xilinx_dma_reset (struct xilinx_dma_chan *chan);
+
+/*********************************************************************************************************
+** 函数名称: _list_line_get_last_node
+** 功能描述: 获取链表最后一个节点
+** 输　入  : head      - 链表头指针
+** 输　出  : 最后一个节点指针；head 为 NULL 时返回 NULL
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static LW_INLINE PLW_LIST_LINE _list_line_get_last_node (PLW_LIST_LINE head)
+{
+    PLW_LIST_LINE pline = head;
+
+    if (!pline) {
+        return LW_NULL;
+    }
+    while (_list_line_get_next(pline)) {
+        pline = _list_line_get_next(pline);
+    }
+    return pline;
+}
 
 /*********************************************************************************************************
   IP 配置结构（每种 IP 类型对应一个配置）
@@ -262,7 +296,10 @@ typedef struct xilinx_dma_chan {
     BOOL                            terminating;
     INT                             irq;
     dma_slave_config_t              slave_cfg;
-    LW_OBJECT_HANDLE                defer_job;
+    PLW_JOB_QUEUE                   defer_job;
+    UINT32                          desc_pendingcount;
+    xilinx_axidma_tx_segment_t     *seg_v;                              /*  DMA 段内存虚拟起始地址      */
+    phys_addr_t                     seg_p;                              /*  DMA 段内存物理起始地址      */
     VOID                            (*start_transfer)(struct xilinx_dma_chan *chan);
     INT                             (*stop_transfer)(struct xilinx_dma_chan *chan);
 } xilinx_dma_chan_t;
@@ -422,7 +459,7 @@ static VOID xilinx_dma_set_coalesce (xilinx_dma_chan_t *chan, UINT32 frame_cnt, 
 *********************************************************************************************************/
 static VOID xilinx_dma_free_tx_descriptor (xilinx_dma_chan_t *chan, xilinx_dma_tx_descriptor_t *desc)
 {
-    xilinx_axidma_tx_segment_t *segment, *next;
+    xilinx_axidma_tx_segment_t *segment;
     PLW_LIST_LINE pline;
 
     if (!desc) {
@@ -463,6 +500,12 @@ static xilinx_axidma_tx_segment_t *xilinx_axidma_alloc_tx_segment (xilinx_dma_ch
     LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
 
     lib_bzero(&segment->hw, sizeof(segment->hw));
+
+#if XILINX_DMA_DEBUG
+    printk("[xilinx_dma] alloc_seg: vaddr=%p phys=0x%x next_after_bzero=0x%x\n",
+           segment, (UINT32)segment->phys, segment->hw.next_desc);
+#endif
+
     return segment;
 }
 
@@ -501,7 +544,7 @@ static INT xilinx_dma_alloc_chan_resources (dma_chan_t *dchan)
         return -1;
     }
 
-    seg_p = (phys_addr_t)API_VmmGetPhysicalAddr(seg_v);
+    API_VmmVirtualToPhysical((addr_t)seg_v, (phys_addr_t *)&seg_p);
 
     chan->cyclic_seg_v = (xilinx_axidma_tx_segment_t *)API_VmmDmaAlloc(
         sizeof(xilinx_axidma_tx_segment_t));
@@ -510,23 +553,33 @@ static INT xilinx_dma_alloc_chan_resources (dma_chan_t *dchan)
         API_VmmDmaFree(seg_v);
         return -1;
     }
-    chan->cyclic_seg_v->phys = (phys_addr_t)API_VmmGetPhysicalAddr(chan->cyclic_seg_v);
+    {
+        phys_addr_t cyc_p;
+        API_VmmVirtualToPhysical((addr_t)chan->cyclic_seg_v, (phys_addr_t *)&cyc_p);
+        chan->cyclic_seg_v->phys = cyc_p;
+    }
 
-    chan->pending_list = LW_NULL;
-    chan->active_list  = LW_NULL;
-    chan->done_list    = LW_NULL;
+    chan->seg_v         = seg_v;
+    chan->seg_p         = seg_p;
+    chan->pending_list  = LW_NULL;
+    chan->active_list   = LW_NULL;
+    chan->done_list     = LW_NULL;
     chan->free_seg_list = LW_NULL;
-    chan->idle         = LW_TRUE;
+    chan->idle          = LW_TRUE;
 
     for (i = 0; i < XILINX_DMA_NUM_DESCS; i++) {
-        seg_v[i].hw.next_desc = (UINT32)((seg_p + sizeof(xilinx_axidma_tx_segment_t) *
-                                ((i + 1) % XILINX_DMA_NUM_DESCS)) & 0xFFFFFFFF);
-        seg_v[i].hw.next_desc_msb = (UINT32)((seg_p + sizeof(xilinx_axidma_tx_segment_t) *
-                                ((i + 1) % XILINX_DMA_NUM_DESCS)) >> 32);
-        seg_v[i].phys = seg_p + i * sizeof(xilinx_axidma_tx_segment_t);
+        seg_v[i].phys = seg_p + (phys_addr_t)i * sizeof(xilinx_axidma_tx_segment_t);
+        /*  next_desc 不预设，由 prep 函数在构建链时填写  */
         _LIST_LINE_INIT_IN_CODE(seg_v[i].node);
         _List_Line_Add_Tail(&seg_v[i].node, &chan->free_seg_list);
     }
+
+#if XILINX_DMA_DEBUG
+    printk("[xilinx_dma] alloc_chan_resources: seg_v=%p seg_p=0x%x stride=%d\n",
+           seg_v, (UINT32)seg_p, (INT)sizeof(xilinx_axidma_tx_segment_t));
+    printk("[xilinx_dma]   seg[0]: vaddr=%p phys=0x%x\n", &seg_v[0], (UINT32)seg_v[0].phys);
+    printk("[xilinx_dma]   seg[1]: vaddr=%p phys=0x%x\n", &seg_v[1], (UINT32)seg_v[1].phys);
+#endif
 
     dma_cookie_init(dchan);
 
@@ -559,7 +612,7 @@ static INT xilinx_dma_alloc_chan_resources (dma_chan_t *dchan)
 *********************************************************************************************************/
 static VOID xilinx_dma_free_descriptors (xilinx_dma_chan_t *chan)
 {
-    xilinx_dma_tx_descriptor_t *desc, *next;
+    xilinx_dma_tx_descriptor_t *desc;
     PLW_LIST_LINE pline;
     INTREG ireg;
 
@@ -611,10 +664,9 @@ static VOID xilinx_dma_free_chan_resources (dma_chan_t *dchan)
         chan->free_seg_list = LW_NULL;
         LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
 
-        if (chan->free_seg_list) {
-            xilinx_axidma_tx_segment_t *seg = _LIST_ENTRY(chan->free_seg_list,
-                                                           xilinx_axidma_tx_segment_t, node);
-            API_VmmDmaFree(seg);
+        if (chan->seg_v) {
+            API_VmmDmaFree(chan->seg_v);
+            chan->seg_v = LW_NULL;
         }
 
         if (chan->cyclic_seg_v) {
@@ -638,7 +690,7 @@ static VOID xilinx_dma_free_chan_resources (dma_chan_t *dchan)
 static VOID xilinx_dma_start_transfer (xilinx_dma_chan_t *chan)
 {
     xilinx_dma_tx_descriptor_t *head_desc, *tail_desc;
-    xilinx_axidma_tx_segment_t *tail_segment;
+    xilinx_axidma_tx_segment_t *head_segment, *tail_segment;
     UINT32 reg;
 
     if (chan->err) {
@@ -654,23 +706,44 @@ static VOID xilinx_dma_start_transfer (xilinx_dma_chan_t *chan)
     }
 
     head_desc = _LIST_ENTRY(chan->pending_list, xilinx_dma_tx_descriptor_t, async_tx.node);
-    tail_desc = _LIST_ENTRY(_list_line_get_last(chan->pending_list),
+    tail_desc = _LIST_ENTRY(_list_line_get_last_node(chan->pending_list),
                             xilinx_dma_tx_descriptor_t, async_tx.node);
-    tail_segment = _LIST_ENTRY(_list_line_get_last(tail_desc->segments),
-                               xilinx_axidma_tx_segment_t, node);
+    head_segment = _LIST_ENTRY(head_desc->segments, xilinx_axidma_tx_segment_t, node);
+    tail_segment = (xilinx_axidma_tx_segment_t *)(addr_t)tail_desc->tail_phys;
 
-    reg = dma_read(chan, XILINX_DMA_REG_DMACR);
-
-    if (chan->desc_pendingcount <= XILINX_DMA_COALESCE_MAX) {
-        reg &= ~XILINX_DMA_CR_COALESCE_MAX;
-        reg |= chan->desc_pendingcount << XILINX_DMA_CR_COALESCE_SHIFT;
-        dma_ctrl_write(chan, XILINX_DMA_REG_DMACR, reg);
+    /*  根据 pending 描述符数量动态配置中断合并  */
+    if (chan->desc_pendingcount > 0) {
+        xilinx_dma_set_coalesce(chan, chan->desc_pendingcount, chan->desc_pendingcount);
     }
 
+#if XILINX_DMA_DEBUG
+    printk("[xilinx_dma] start_transfer ch%d: head_phys=0x%x tail_phys=0x%x\n",
+           chan->id, (UINT32)head_segment->phys, (UINT32)tail_segment->phys);
+    printk("[xilinx_dma]   head_seg: buf=0x%x ctrl=0x%x next=0x%x\n",
+           head_segment->hw.buf_addr, head_segment->hw.control, head_segment->hw.next_desc);
+    printk("[xilinx_dma]   tail_seg: buf=0x%x ctrl=0x%x next=0x%x\n",
+           tail_segment->hw.buf_addr, tail_segment->hw.control, tail_segment->hw.next_desc);
+    reg = dma_read(chan, XILINX_DMA_REG_DMASR);
+    printk("[xilinx_dma]   DMASR before start: 0x%x (idle=%d halted=%d)\n",
+           reg, !!(reg & XILINX_DMA_DMASR_IDLE), !!(reg & XILINX_DMA_DMASR_HALTED));
+#endif
+
     if (chan->has_sg) {
-        dma_write(chan, XILINX_DMA_REG_CURDESC, (UINT32)(head_desc->async_tx.phys & 0xFFFFFFFF));
+        /*
+         *  AXI DMA PG021: CURDESC 只能在 DMACR.RS=0（通道停止）时写入。
+         *  上一次传输完成后通道处于 IDLE 但仍 RUNNING（RS=1）状态；
+         *  此时写 CURDESC 会被硬件静默忽略，导致 CURDESC=0，触发 DMA_INT_ERR。
+         *  因此，写 CURDESC 前须先停止通道，等待 Halted=1。
+         */
+        reg = dma_read(chan, XILINX_DMA_REG_DMASR);
+        if (!(reg & XILINX_DMA_DMASR_HALTED)) {
+            if (chan->stop_transfer) {
+                chan->stop_transfer(chan);
+            }
+        }
+        dma_write(chan, XILINX_DMA_REG_CURDESC, (UINT32)(head_desc->phys & 0xFFFFFFFF));
         if (chan->xdev->ext_addr) {
-            dma_write(chan, XILINX_DMA_REG_CURDESC_MSB, (UINT32)(head_desc->async_tx.phys >> 32));
+            dma_write(chan, XILINX_DMA_REG_CURDESC_MSB, (UINT32)((UINT64)head_desc->phys >> 32));
         }
     }
 
@@ -682,16 +755,21 @@ static VOID xilinx_dma_start_transfer (xilinx_dma_chan_t *chan)
         return;
     }
 
+    /*  内存屏障：确保描述符写入对硬件可见  */
+    KN_SMP_WMB();
+
     if (chan->has_sg) {
         if (chan->cyclic) {
             dma_write(chan, XILINX_DMA_REG_TAILDESC, (UINT32)(chan->cyclic_seg_v->phys & 0xFFFFFFFF));
             if (chan->xdev->ext_addr) {
-                dma_write(chan, XILINX_DMA_REG_TAILDESC_MSB, (UINT32)(chan->cyclic_seg_v->phys >> 32));
+                dma_write(chan, XILINX_DMA_REG_TAILDESC_MSB,
+                          (UINT32)((UINT64)chan->cyclic_seg_v->phys >> 32));
             }
         } else {
             dma_write(chan, XILINX_DMA_REG_TAILDESC, (UINT32)(tail_segment->phys & 0xFFFFFFFF));
             if (chan->xdev->ext_addr) {
-                dma_write(chan, XILINX_DMA_REG_TAILDESC_MSB, (UINT32)(tail_segment->phys >> 32));
+                dma_write(chan, XILINX_DMA_REG_TAILDESC_MSB,
+                          (UINT32)((UINT64)tail_segment->phys >> 32));
             }
         }
     } else {
@@ -716,6 +794,41 @@ static VOID xilinx_dma_start_transfer (xilinx_dma_chan_t *chan)
     }
     chan->desc_pendingcount = 0;
     chan->idle = LW_FALSE;
+
+#if XILINX_DMA_DEBUG
+    reg = dma_read(chan, XILINX_DMA_REG_DMASR);
+    printk("[xilinx_dma]   DMASR after start: 0x%x\n", reg);
+    printk("[xilinx_dma]   CURDESC=0x%x TAILDESC=0x%x\n",
+           dma_read(chan, XILINX_DMA_REG_CURDESC),
+           dma_read(chan, XILINX_DMA_REG_TAILDESC));
+#endif
+}
+
+/*********************************************************************************************************
+** 函数名称: xilinx_dma_reset
+** 功能描述: 复位 DMA 通道
+** 输　入  : chan      - 通道指针
+** 输　出  : 0 成功；-1 超时
+** 全局变量:
+** 调用模块:
+*********************************************************************************************************/
+static INT xilinx_dma_reset (xilinx_dma_chan_t *chan)
+{
+    UINT32 reg;
+    INT timeout = XILINX_DMA_LOOP_COUNT;
+
+    dma_write(chan, XILINX_DMA_REG_DMACR, XILINX_DMA_DMACR_RESET);
+
+    /*  等待复位完成  */
+    while (timeout--) {
+        reg = dma_read(chan, XILINX_DMA_REG_DMACR);
+        if (!(reg & XILINX_DMA_DMACR_RESET)) {
+            return 0;
+        }
+    }
+
+    printk("[xilinx_dma] reset timeout\n");
+    return -1;
 }
 
 /*********************************************************************************************************
@@ -899,7 +1012,7 @@ static dma_async_tx_descriptor_t *xilinx_dma_prep_slave_sg (
 {
     xilinx_dma_chan_t *chan = _LIST_ENTRY(dchan, xilinx_dma_chan_t, common);
     xilinx_dma_tx_descriptor_t *desc;
-    xilinx_axidma_tx_segment_t *segment, *prev = LW_NULL;
+    xilinx_axidma_tx_segment_t *segment, *prev = LW_NULL, *first = LW_NULL;
     UINT32 *app_w = (UINT32 *)context;
     phys_addr_t buf_addr;
     UINT i;
@@ -928,10 +1041,13 @@ static dma_async_tx_descriptor_t *xilinx_dma_prep_slave_sg (
             return LW_NULL;
         }
 
+        /*  虚拟地址转物理地址  */
         buf_addr = sgl[i].addr;
+        API_VmmVirtualToPhysical((addr_t)buf_addr, &buf_addr);
+
         segment->hw.buf_addr = (UINT32)(buf_addr & 0xFFFFFFFF);
         if (chan->xdev->ext_addr) {
-            segment->hw.buf_addr_msb = (UINT32)(buf_addr >> 32);
+            segment->hw.buf_addr_msb = (UINT32)((UINT64)buf_addr >> 32);
         }
 
         segment->hw.control = sgl[i].len & chan->xdev->max_buffer_len;
@@ -940,10 +1056,16 @@ static dma_async_tx_descriptor_t *xilinx_dma_prep_slave_sg (
             lib_memcpy(segment->hw.app, app_w, sizeof(UINT32) * XILINX_DMA_NUM_APP_WORDS);
         }
 
+        /*  记录第一个段，用于设置 SOP 和 desc->phys  */
+        if (!first) {
+            first = segment;
+        }
+
+        /*  将当前段链接到前一个段的 next_desc  */
         if (prev) {
             prev->hw.next_desc = (UINT32)(segment->phys & 0xFFFFFFFF);
             if (chan->xdev->ext_addr) {
-                prev->hw.next_desc_msb = (UINT32)(segment->phys >> 32);
+                prev->hw.next_desc_msb = (UINT32)((UINT64)segment->phys >> 32);
             }
             API_CacheClear(DATA_CACHE, prev, sizeof(xilinx_axidma_tx_segment_t));
         }
@@ -952,19 +1074,34 @@ static dma_async_tx_descriptor_t *xilinx_dma_prep_slave_sg (
         prev = segment;
     }
 
-    segment = _LIST_ENTRY(desc->segments, xilinx_axidma_tx_segment_t, node);
-    desc->async_tx.phys = segment->phys;
+    /*  prev 现在是最后一个段，设置 EOP，next_desc 保持 0  */
+    prev->hw.control  |= XILINX_DMA_BD_EOP;
+    prev->hw.next_desc     = 0;
+    prev->hw.next_desc_msb = 0;
+    API_CacheClear(DATA_CACHE, prev, sizeof(xilinx_axidma_tx_segment_t));
 
-    if (chan->direction == DMA_MEM_TO_DEV) {
-        segment->hw.control |= XILINX_DMA_BD_SOP;
-        segment = _LIST_ENTRY(_list_line_get_last(desc->segments),
-                              xilinx_axidma_tx_segment_t, node);
-        segment->hw.control |= XILINX_DMA_BD_EOP;
-    }
+    /*  第一个段设置 SOP  */
+    first->hw.control |= XILINX_DMA_BD_SOP;
+    API_CacheClear(DATA_CACHE, first, sizeof(xilinx_axidma_tx_segment_t));
+
+    desc->phys      = first->phys;
+    desc->tail_phys = prev->phys;
 
     desc->async_tx.chan = dchan;
     desc->async_tx.flags = flags;
     desc->async_tx.tx_submit = xilinx_dma_tx_submit;
+
+#if XILINX_DMA_DEBUG
+    {
+        xilinx_dma_chan_t *chan = _LIST_ENTRY(dchan, xilinx_dma_chan_t, common);
+        xilinx_axidma_tx_segment_t *first = _LIST_ENTRY(desc->segments, xilinx_axidma_tx_segment_t, node);
+        printk("[xilinx_dma] prep_slave_sg ch%d: sg_len=%d dir=%d\n",
+               chan->id, sg_len, direction);
+        printk("[xilinx_dma]   first_seg: buf=0x%x len=%d ctrl=0x%x\n",
+               first->hw.buf_addr, sgl[0].len, first->hw.control);
+    }
+#endif
+
     return &desc->async_tx;
 }
 
@@ -1002,18 +1139,25 @@ static dma_async_tx_descriptor_t *xilinx_dma_prep_dma_memcpy (
         return LW_NULL;
     }
 
+    /*  虚拟地址转物理地址  */
+    API_VmmVirtualToPhysical((addr_t)src, &src);
+
+
     segment->hw.buf_addr = (UINT32)(src & 0xFFFFFFFF);
     if (chan->xdev->ext_addr) {
-        segment->hw.buf_addr_msb = (UINT32)(src >> 32);
+        segment->hw.buf_addr_msb = (UINT32)((UINT64)src >> 32);
     }
 
     segment->hw.control = (len & chan->xdev->max_buffer_len) | XILINX_DMA_BD_SOP | XILINX_DMA_BD_EOP;
     segment->hw.next_desc = 0;
     segment->hw.next_desc_msb = 0;
 
+    API_CacheClear(DATA_CACHE, segment, sizeof(xilinx_axidma_tx_segment_t));
+
     _List_Line_Add_Tail(&segment->node, &desc->segments);
 
-    desc->async_tx.phys = segment->phys;
+    desc->phys      = segment->phys;
+    desc->tail_phys = segment->phys;
     desc->async_tx.chan = dchan;
     desc->async_tx.flags = flags;
     desc->async_tx.tx_submit = xilinx_dma_tx_submit;
@@ -1038,6 +1182,7 @@ static dma_cookie_t xilinx_dma_tx_submit (dma_async_tx_descriptor_t *tx)
     LW_SPIN_LOCK_IRQ(&chan->lock, &ireg);
     cookie = dma_cookie_assign(tx);
     _List_Line_Add_Tail(&tx->node, &chan->pending_list);
+    chan->desc_pendingcount++;
     chan->terminating = LW_FALSE;
     LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
 
@@ -1058,7 +1203,7 @@ static dma_cookie_t xilinx_dma_tx_submit (dma_async_tx_descriptor_t *tx)
 *********************************************************************************************************/
 static VOID xilinx_dma_complete_descriptor (xilinx_dma_chan_t *chan)
 {
-    xilinx_dma_tx_descriptor_t *desc, *next;
+    xilinx_dma_tx_descriptor_t *desc;
 
     if (!chan->active_list) {
         return;
@@ -1086,7 +1231,7 @@ static VOID xilinx_dma_complete_descriptor (xilinx_dma_chan_t *chan)
 static VOID xilinx_dma_chan_desc_cleanup (xilinx_dma_chan_t *chan)
 {
     xilinx_dma_tx_descriptor_t *desc;
-    dma_async_tx_descriptor_callback_result_t cb;
+    dma_async_tx_callback_result cb;
     PVOID cb_param;
     dmaengine_result_t result;
     INTREG ireg;
@@ -1100,12 +1245,10 @@ static VOID xilinx_dma_chan_desc_cleanup (xilinx_dma_chan_t *chan)
         cb = desc->async_tx.callback_result;
         cb_param = desc->async_tx.callback_param;
 
-        dma_cookie_complete(&desc->async_tx);
-
         LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
 
         if (cb) {
-            result.result = desc->err ? DMA_TRANS_ABORTED : DMA_TRANS_NOERROR;
+            result.result  = desc->err ? DMA_ERROR : DMA_COMPLETE;
             result.residue = desc->residue;
             cb(cb_param, &result);
         }
@@ -1156,9 +1299,12 @@ static irqreturn_t xilinx_dma_irq_handler (PVOID data, ULONG vector)
 {
     xilinx_dma_chan_t *chan = (xilinx_dma_chan_t *)data;
     UINT32 status;
-    INTREG ireg;
 
     status = dma_read(chan, XILINX_DMA_REG_DMASR);
+
+#if XILINX_DMA_DEBUG
+    printk("[xilinx_dma] IRQ ch%d: DMASR=0x%x\n", chan->id, status);
+#endif
 
     if (!(status & XILINX_DMA_DMAXR_ALL_IRQ_MASK)) {
         return LW_IRQ_NONE;
@@ -1178,6 +1324,11 @@ static irqreturn_t xilinx_dma_irq_handler (PVOID data, ULONG vector)
                    dma_read(chan, XILINX_DMA_REG_CURDESC),
                    dma_read(chan, XILINX_DMA_REG_TAILDESC));
             chan->err = LW_TRUE;
+
+            /*  停止传输并标记所有 active 描述符为错误  */
+            if (chan->stop_transfer) {
+                chan->stop_transfer(chan);
+            }
         }
     }
 
@@ -1186,13 +1337,11 @@ static irqreturn_t xilinx_dma_irq_handler (PVOID data, ULONG vector)
     }
 
     if (status & XILINX_DMA_DMASR_FRM_CNT_IRQ) {
-        LW_SPIN_LOCK(&chan->lock, &ireg);
+        INTREG ireg;
+        LW_SPIN_LOCK_IRQ(&chan->lock, &ireg);
         xilinx_dma_complete_descriptor(chan);
         chan->idle = LW_TRUE;
-        if (chan->start_transfer) {
-            chan->start_transfer(chan);
-        }
-        LW_SPIN_UNLOCK(&chan->lock, ireg);
+        LW_SPIN_UNLOCK_IRQ(&chan->lock, ireg);
     }
 
     API_InterDeferJobAdd(chan->defer_job, xilinx_dma_do_tasklet, chan);
@@ -1252,7 +1401,15 @@ static INT xilinx_dma_chan_probe (xilinx_dma_device_t *xdev, INT child_idx, INT 
     if (xdev->dma_config->dmatype == XDMA_TYPE_AXIDMA) {
         chan->start_transfer = xilinx_dma_start_transfer;
         chan->stop_transfer  = xilinx_dma_stop_transfer;
+
+        /*  复位通道  */
+        if (xilinx_dma_reset(chan) != 0) {
+            printk("[xilinx_dma] failed to reset channel %d\n", chan_id);
+            sys_free(chan);
+            return -1;
+        }
     } else {
+        /*  TODO: 实现 CDMA/VDMA/MCDMA 的 start_transfer 和 stop_transfer  */
         chan->start_transfer = LW_NULL;
         chan->stop_transfer  = LW_NULL;
     }
@@ -1260,11 +1417,7 @@ static INT xilinx_dma_chan_probe (xilinx_dma_device_t *xdev, INT child_idx, INT 
     chan->defer_job = API_InterDeferGet(0);
 
     if (irq > 0) {
-        {
-            #define IRQ_TYPE_LEVEL_HIGH             (0x00000004)
-            extern VOID  bspIntVectorTypeSet(ULONG  ulVector, INT  iType);
-            bspIntVectorTypeSet(irq, IRQ_TYPE_LEVEL_HIGH);
-        }
+        bspIntVectorTypeSet(irq, IRQ_TYPE_LEVEL_HIGH);
         API_InterVectorConnect(irq, xilinx_dma_irq_handler, chan, "xilinx-dma");
         API_InterVectorEnable(irq);
     }
@@ -1380,8 +1533,9 @@ INT  xilinx_dma_params_register (const xilinx_board_params_t *params)
     }
     lib_bzero(xdev, sizeof(xilinx_dma_device_t));
 
-    xdev->regs = (void *)API_VmmMap((PVOID)params->reg_base, (PVOID)params->reg_base,
+    API_VmmMap((PVOID)params->reg_base, (PVOID)params->reg_base,
                             params->reg_size, LW_VMM_FLAG_DMA);
+    xdev->regs = params->reg_base;
     if (!xdev->regs) {
         printk("[xilinx_dma] params_register: failed to map registers\n");
         sys_free(xdev);
