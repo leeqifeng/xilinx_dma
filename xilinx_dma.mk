@@ -33,12 +33,10 @@ LOCAL_TARGET_NAME := xilinx_dma.ko
 # Source list
 #*********************************************************************************************************
 LOCAL_SRCS :=  \
-src/drv/dma_adapter.c \
-src/drv/dma_client.c \
-src/drv/dma_core.c \
-src/drv/dma_hw.c \
-src/test/dma_test.c \
-src/xilinx_dma.c
+src/dma.c \
+src/dmaengine.c \
+src/hw/demoip/demoip.c \
+src/test/dma_test.c
 
 #*********************************************************************************************************
 # Header file search path (eg. LOCAL_INC_PATH := -I"Your header files search path")
