@@ -71,7 +71,12 @@ LW_API ULONG        API_VmmMap(PVOID  pvVirtualAddr,
                                PVOID  pvPhysicalAddr,
                                size_t stSize,
                                ULONG  ulFlag);                          /*  直接映射,映射后地址可直接访问 */
-
+/*
+ * 典型用法
+ * API_VmmMap((PVOID)params->reg_base, (PVOID)params->reg_base,
+ *                         params->reg_size, LW_VMM_FLAG_DMA);
+ * dev->regs = params->reg_base;
+ */
                    
 LW_API PVOID        API_VmmMalloc(size_t stSize);                       /*  分配逻辑连续内存, 虚拟地址  */
 LW_API PVOID        API_VmmMallocEx(size_t stSize, ULONG ulFlag);       /*  分配逻辑连续内存, 虚拟地址  */

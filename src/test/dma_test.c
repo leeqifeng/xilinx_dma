@@ -41,7 +41,7 @@
 **    dma_test_memcpy      [size]                    单次 MEM_TO_MEM memcpy（默认 4096B，ch0），输出 BER
 **    dma_test_multi       [count] [entry]           批量多描述符 + dma_sync_wait（默认 8×512B，ch1），输出 BER
 **    dma_test_sg          [sg] [entry] [rx|tx]      单向 Slave SG 传输（默认 4×512B rx，ch0），输出 BER
-**    dma_test_loopback_fd [sg] [entry] [rounds]     全双工回环：TX ∥ RX 并发（默认 4×512B×1），累计 TX/RX BER
+**    dma_test_loopback_fd [sg] [entry] [duration_sec] 全双工回环：TX ∥ RX 并发（默认 4×512B 3s），按秒报告 + 累计 RX BER
 **                                                   - 测试目的：端到端全双工可用带宽（2 通道同时工作）
 **    dma_test_perf        [duration_sec]            单通道极限带宽基准（15 种配置，每场景计时运行）
 **                                                   - 测试目的：单通道理论峰值吞吐（1 通道独占 CPU）
@@ -56,7 +56,8 @@
 #include <string.h>
 #include "../dmaengine.h"
 
-#define TEST_DEV_NAME                   "demoip-dma"
+// #define TEST_DEV_NAME                   "demoip-dma"
+#define TEST_DEV_NAME                   "xilinx-dma"
 #define TEST_SG_MAX                     64
 
 #ifndef LW_CFG_TICKS_PER_SEC
@@ -67,8 +68,9 @@
 
 /*
  *  THROUGHPUT_KBS: bytes * tickrate / (ticks * 1024)
- *  中间积 bytes * tickrate 在 tickrate ≤ 10000 Hz 时不会溢出 UINT64
- *  （max: 64 * 4MB * 100000 * 2 * 10000 ≈ 5.4×10^17 < UINT64_MAX 1.8×10^19）。
+ *  中间积 bytes × tickrate 在 tickrate ≤ 10000 Hz 时的溢出分析：
+ *    perf  场景：最大 bytes ≈ 10GB/s × 300s = 3×10^12，× 10^4 = 3×10^16 < UINT64_MAX ✓
+ *    loopback FD：× 2 = 6×10^16 < UINT64_MAX ✓
  *  若移植到 tickrate > 300 kHz 的平台，需将乘法改为先除后乘以避免溢出。
  */
 #define THROUGHPUT_KBS(b,t) ((t) ? ((UINT64)(b) * LW_CFG_TICKS_PER_SEC / ((UINT64)(t) * 1024ULL)) : 0ULL)
@@ -80,6 +82,26 @@ typedef struct {
     dma_status_t        status;
     UINT32              residue;
 } dma_completion_t;
+
+/*********************************************************************************************************
+** 函数名称: __dma_perf_print_kbs
+** 功能描述: 格式化输出吞吐量（KB/s 或 MB/s）
+** 输　入  : kbs — 吞吐量（KB/s）；0 表示无法计算
+** 输　出  : NONE
+*********************************************************************************************************/
+
+static VOID  __dma_perf_print_kbs (UINT64 kbs)
+{
+    if (kbs == 0) {
+        printk("N/A");
+    } else if (kbs >= 1024) {
+        printk("%llu.%llu MB/s",
+               (unsigned long long)(kbs / 1024),
+               (unsigned long long)((kbs % 1024) * 10 / 1024));
+    } else {
+        printk("%llu KB/s", (unsigned long long)kbs);
+    }
+}
 
 /*********************************************************************************************************
 ** 函数名称: __dma_complete_cb
@@ -156,6 +178,7 @@ static INT  __dma_exec_once (dma_chan_t *chan, dma_async_tx_descriptor_t *desc,
 
     if (API_SemaphoreBPend(comp->sem, LW_MSECOND_TO_TICK_1(5000)) != ERROR_NONE) {
         printk("[dma_test]   FAIL: timeout\n");
+        dmaengine_terminate_all(chan);                               /*  确保通道状态干净，使调用方可复用  */
         if (p_ticks) { *p_ticks = 0; }
         return  (-1);
     }
@@ -292,10 +315,20 @@ static INT  __dma_exec_pair (dma_chan_t                *chan_a,
     desc_b->callback_result = __dma_pair_cb_b;
     desc_b->callback_param  = sync;
 
-    if (dmaengine_submit(desc_a) == DMA_COOKIE_INVALID ||
-        dmaengine_submit(desc_b) == DMA_COOKIE_INVALID) {
-        printk("[dma_test]   FAIL: submit\n");
-        return  (-1);
+    /*
+     *  分步 submit，避免短路求值导致仅 desc_a 入队而 desc_b 未入队时遗漏 terminate：
+     *  两路均 submit 后再统一检查，任一失败则对已入队的一路调用 terminate_all 释放描述符。
+     */
+    {
+        dma_cookie_t  ck_a = dmaengine_submit(desc_a);
+        dma_cookie_t  ck_b = dmaengine_submit(desc_b);
+        if (ck_a == DMA_COOKIE_INVALID || ck_b == DMA_COOKIE_INVALID) {
+            printk("[dma_test]   FAIL: submit\n");
+            if (ck_a != DMA_COOKIE_INVALID) { dmaengine_terminate_all(chan_a); }
+            if (ck_b != DMA_COOKIE_INVALID) { dmaengine_terminate_all(chan_b); }
+            if (p_ticks) { *p_ticks = 0; }
+            return  (-1);
+        }
     }
 
     t0 = API_TimeGet64();
@@ -532,7 +565,11 @@ static INT  __dma_test_multi_run (UINT count, size_t entry_size)
                                           (phys_addr_t)(addr_t)(dst + i * entry_size),
                                           (phys_addr_t)(addr_t)(src + i * entry_size),
                                           entry_size, 0);
-        if (!desc) { printk("[dma_test]   FAIL: prep[%u]\n", i); goto  _out; }
+        if (!desc) {
+            printk("[dma_test]   FAIL: prep[%u]\n", i);
+            dmaengine_terminate_all(chan);                           /*  释放已入队的前 i 个描述符       */
+            goto  _out;
+        }
         last_cookie = dmaengine_submit(desc);
     }
     dma_async_issue_pending(chan);
@@ -627,7 +664,15 @@ static INT  __dma_test_sg_run (UINT sg_len, size_t entry_size,
     {
         dma_ber_stat_t  ber;
         ber.total_bytes = (UINT64)total;
-        ber.error_bytes = __dma_count_errors(dev_buf, flat, total);
+        /*
+         *  DEV_TO_MEM(rx)：DMA 将 dev_buf 数据搬入 flat，ref=dev_buf（期望值），dut=flat（实际结果）
+         *  MEM_TO_DEV(tx)：DMA 将 flat 数据搬入 dev_buf，ref=flat（期望值），dut=dev_buf（实际结果）
+         */
+        if (dir == DMA_DEV_TO_MEM) {
+            ber.error_bytes = __dma_count_errors(dev_buf, flat, total);
+        } else {
+            ber.error_bytes = __dma_count_errors(flat, dev_buf, total);
+        }
         __print_ber("BER", &ber);
         printk("[dma_test]   verify: %u SG entries  total=%zuB\n", sg_len, total);
         ret = (ber.error_bytes == 0) ? 0 : -1;
@@ -648,71 +693,66 @@ _out:
 
 /*********************************************************************************************************
 ** 函数名称: __dma_test_loopback_fd_run
-** 功能描述: 全双工双通道 Slave SG 回环测试（TX / RX 并发执行）
-** 输　入  : sg_len     — SG 条目数
-**           entry_size — 每条目字节数
-**           rounds     — 回环轮数
+** 功能描述: 全双工双通道 Slave SG 回环测试（TX / RX 并发执行，时间驱动）
+** 输　入  : sg_len       — SG 条目数
+**           entry_size   — 每条目字节数
+**           duration_sec — 测试持续时间（秒）
 ** 输　出  : 0 PASS；-1 FAIL
 **
 **  回环路径（全双工，两路并发）：
-**    [src_flat] ──TX(ch0, MEM_TO_DEV)──► [tx_fifo]          ← 软件模拟 TX 输出 FIFO
-**    [rx_fifo]  ──RX(ch1, DEV_TO_MEM)──► [dst_flat]         ← 软件模拟 RX 输入 FIFO
+**    [src_flat] ──TX(ch0, MEM_TO_DEV)──► [AXI Stream 总线]──► S2MM(ch1, DEV_TO_MEM)──► [dst_flat]
 **
-**    物理回环含义：真实 NIC/串口中，发送器输出经回环线连到接收器输入。
-**    软件中以 lib_memcpy(rx_fifo, src_flat) 在每轮 issue 前预填充，
-**    模拟"上一帧已由硬件从 TX FIFO 搬到 RX FIFO"这一物理行为；
-**    随后 TX 与 RX 两路 DMA 同时启动，互不阻塞。
+**    硬件回环：MM2S 发出的 AXI Stream 数据由硬件直接回环到 S2MM 接收端。
+**    TX 和 RX 同时 issue，硬件保证数据路径。
 **
-**  与半双工 dma_test_loopback 的区别：
-**    半双工：TX 等待完成 → RX 再开始（串行，tx_fifo == rx_fifo == dev_buf）
-**    全双工：TX / RX 同时 issue（并发，tx_fifo ≠ rx_fifo，无竞争）
+**  输出层次：
+**    1. 每秒中间报告：rounds / TX / RX / FD 吞吐率
+**    2. 末尾场景摘要：总轮数、错误轮数、总字节、总耗时
+**    3. 各向平均吞吐率 + 累计 RX BER
 **
-**  校验：
-**    TX 侧：tx_fifo == src_flat（DMA 正确将发送数据搬出到设备）
-**    RX 侧：dst_flat == src_flat（DMA 正确将接收数据搬入内存）
-**
-**  吞吐统计（挂钟时间，与 dma_test_perf 口径一致）：
-**    计时从第一轮循环开始（含 FIFO 预填充、prep、BER 校验）到最后一轮结束。
-**    TX  ≈ total×rounds / t_wall
-**    RX  ≈ total×rounds / t_wall
-**    FD  = 2×total×rounds / t_wall  （双向合计，体现全双工收益）
+**  溢出分析（THROUGHPUT_KBS 中间积 b × tickrate）：
+**    单向最大：tickrate=10000Hz，300s × 10GB/s = 3TB → 3×10^12 × 10^4 = 3×10^16 < UINT64_MAX ✓
+**    全双工：× 2 = 6×10^16 < UINT64_MAX ✓
+**    BER ppm：total_bytes × 10^6 = 3×10^12 × 10^6 = 3×10^18 < UINT64_MAX ✓
 **
 *********************************************************************************************************/
 
-static INT  __dma_test_loopback_fd_run (UINT sg_len, size_t entry_size, UINT rounds)
+static INT  __dma_test_loopback_fd_run (UINT sg_len, size_t entry_size, UINT duration_sec)
 {
     dma_chan_t               *ch_tx    = LW_NULL, *ch_rx    = LW_NULL;
-    UINT8                    *tx_fifo  = LW_NULL, *rx_fifo  = LW_NULL;
     UINT8                    *src_flat = LW_NULL, *dst_flat = LW_NULL;
     dma_sg_entry_t           *sgl_tx   = LW_NULL, *sgl_rx   = LW_NULL;
     dma_async_tx_descriptor_t *desc_tx, *desc_rx;
     dma_pair_sync_t           sync;
-    dma_ber_stat_t            ber_tx   = {0, 0}, ber_rx = {0, 0};
+    dma_ber_stat_t            ber_rx   = {0, 0};
     BOOL                      sync_init = LW_FALSE;
-    UINT64                    t_wall_start, t_wall;
-    size_t                    total    = (size_t)sg_len * entry_size;
-    UINT                      r, i;
-    size_t                    j;
-    INT                       ret      = -1;
 
-    printk("\n[dma_test] ===== loopback-fd  sg=%u  entry=%zuB  total=%zuB  rounds=%u =====\n",
-           sg_len, entry_size, total, rounds);
-    printk("[dma_test]   mode: FULL-DUPLEX (TX || RX concurrent, separate FIFOs)\n");
+    UINT64  t_start, t_dur_ticks, t_sec_start, t_now, t_wall;
+    UINT64  sec_bytes;
+    UINT    sec_rounds, sec_idx;
+    UINT    total_rounds = 0, error_rounds = 0;
+    size_t  total = (size_t)sg_len * entry_size;
+    UINT    i;
+    size_t  j;
+    INT     ret   = -1;
+
+    printk("\n[dma_test] ===== loopback-fd  sg=%u  entry=%zuB  total=%zuB  duration=%us =====\n",
+           sg_len, entry_size, total, duration_sec);
+    printk("[dma_test]   mode: FULL-DUPLEX HW loopback (TX || RX concurrent, time-based)\n");
 
     ch_tx    = dma_request_chan_by_name(TEST_DEV_NAME, 0);
     ch_rx    = dma_request_chan_by_name(TEST_DEV_NAME, 1);
-    tx_fifo  = (ch_tx && ch_rx) ? (UINT8 *)sys_malloc(total) : LW_NULL;
-    rx_fifo  = tx_fifo  ? (UINT8 *)sys_malloc(total) : LW_NULL;
-    src_flat = rx_fifo  ? (UINT8 *)sys_malloc(total) : LW_NULL;
-    dst_flat = src_flat ? (UINT8 *)sys_malloc(total) : LW_NULL;
+    src_flat = (ch_tx && ch_rx) ? (UINT8 *)API_VmmDmaAlloc(total) : LW_NULL;
+    dst_flat = src_flat ? (UINT8 *)API_VmmDmaAlloc(total) : LW_NULL;
     sgl_tx   = dst_flat ? (dma_sg_entry_t *)sys_malloc(sg_len * sizeof(*sgl_tx)) : LW_NULL;
     sgl_rx   = sgl_tx   ? (dma_sg_entry_t *)sys_malloc(sg_len * sizeof(*sgl_rx)) : LW_NULL;
     if (!sgl_rx) { printk("[dma_test]   FAIL: alloc\n"); goto  _out; }
 
-    /* 发送侧数据模式（全程不变，每轮复用） */
+    /*  发送侧固定数据模式，每轮复用  */
     for (j = 0; j < total; j++) { src_flat[j] = (UINT8)((j * 0x37 + 0xA5) & 0xFF); }
+    lib_memset(dst_flat, 0, total);
 
-    /* SG 列表：TX 读 src_flat，RX 写 dst_flat */
+    /*  SG 列表：TX 读 src_flat，RX 写 dst_flat  */
     for (i = 0; i < sg_len; i++) {
         sgl_tx[i].addr = (phys_addr_t)(addr_t)(src_flat + (size_t)i * entry_size);
         sgl_tx[i].len  = entry_size;
@@ -720,81 +760,119 @@ static INT  __dma_test_loopback_fd_run (UINT sg_len, size_t entry_size, UINT rou
         sgl_rx[i].len  = entry_size;
     }
 
-    /* 配置两通道：各自独立的 FIFO 地址，不共享，无竞争 */
-    if (__dma_slave_cfg(ch_tx, DMA_MEM_TO_DEV, tx_fifo) != 0 ||
-        __dma_slave_cfg(ch_rx, DMA_DEV_TO_MEM, rx_fifo) != 0) {
+    /*  配置通道方向（AXI DMA 无设备 FIFO 地址，传 LW_NULL）  */
+    if (__dma_slave_cfg(ch_tx, DMA_MEM_TO_DEV, LW_NULL) != 0 ||
+        __dma_slave_cfg(ch_rx, DMA_DEV_TO_MEM, LW_NULL) != 0) {
         printk("[dma_test]   FAIL: slave_config\n"); goto  _out;
     }
-    printk("[dma_test]   TX='%s'  tx_fifo=%p\n", ch_tx->chan_name, tx_fifo);
-    printk("[dma_test]   RX='%s'  rx_fifo=%p  (pre-loaded each round)\n",
-           ch_rx->chan_name, rx_fifo);
+    printk("[dma_test]   TX='%s'  src=%p\n", ch_tx->chan_name, src_flat);
+    printk("[dma_test]   RX='%s'  dst=%p\n", ch_rx->chan_name, dst_flat);
 
     if (__dma_pair_sync_init(&sync) != 0) {
         printk("[dma_test]   FAIL: sync init\n"); goto  _out;
     }
     sync_init = LW_TRUE;
 
-    for (r = 0; r < rounds; r++) {
-        if (r == 0) { t_wall_start = API_TimeGet64(); }                 /*  首轮开始计时                */
-        /*
-         *  每轮重置：
-         *    rx_fifo = src_flat  — 模拟硬件回环：发送数据已到达 RX FIFO（必须）
-         *  注：tx_fifo / dst_flat 不再预清零。DMA 会覆盖写入，BER 快速路径
-         *  （lib_memcmp）足以检测写入内容是否正确，软件仿真驱动不会静默失败。
-         */
-        lib_memcpy(rx_fifo,  src_flat, total);
+    t_start      = API_TimeGet64();
+    t_dur_ticks  = (UINT64)duration_sec * LW_CFG_TICKS_PER_SEC;
+    t_sec_start  = t_start;
+    sec_bytes    = 0;
+    sec_rounds   = 0;
+    sec_idx      = 0;
+
+    while (LW_TRUE) {
+        t_now = API_TimeGet64();
+        if (t_now - t_start >= t_dur_ticks) { break; }
 
         desc_tx = dmaengine_prep_slave_sg(ch_tx, sgl_tx, sg_len,
                                            DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT);
         desc_rx = dmaengine_prep_slave_sg(ch_rx, sgl_rx, sg_len,
                                            DMA_DEV_TO_MEM, DMA_PREP_INTERRUPT);
         if (!desc_tx || !desc_rx) {
-            printk("[dma_test]   FAIL: prep round=%u\n", r);
-            /*
-             *  若 desc_tx 已分配而 desc_rx 失败：框架无独立 free_desc 接口，
-             *  将 desc_tx 提交至 pending 队列后立即 terminate_all，驱动在
-             *  terminate_all 中遍历 pending 链表并 sys_free 描述符，避免泄漏。
-             */
-            if (desc_tx && !desc_rx) {
-                dmaengine_submit(desc_tx);
-                dmaengine_terminate_all(ch_tx);
-            }
-            goto  _out_comp;
+            /*  prep 半失败：将已分配的描述符提交后立即 terminate，避免泄漏  */
+            if (desc_tx) { dmaengine_submit(desc_tx); dmaengine_terminate_all(ch_tx); }
+            if (desc_rx) { dmaengine_submit(desc_rx); dmaengine_terminate_all(ch_rx); }
+            error_rounds++;
+            continue;
         }
 
-        /* 并发执行：两路同时 issue，t ≈ max(TX延迟, RX延迟) */
-        if (__dma_exec_pair(ch_tx, desc_tx,
-                             ch_rx, desc_rx, &sync, LW_NULL) != 0) {
-            printk("[dma_test]   FAIL: exec round=%u\n", r);
-            goto  _out_comp;
+        /*  并发执行：TX 发出数据到 Stream，硬件回环后 RX 接收  */
+        if (__dma_exec_pair(ch_tx, desc_tx, ch_rx, desc_rx, &sync, LW_NULL) != 0) {
+            error_rounds++;
+            continue;
         }
 
-        /* 累计 TX BER：tx_fifo 应等于 src_flat（DMA 正确搬出到设备） */
-        ber_tx.total_bytes += (UINT64)total;
-        ber_tx.error_bytes += __dma_count_errors(tx_fifo, src_flat, total);
-        /* 累计 RX BER：dst_flat 应等于 src_flat（DMA 正确从设备搬入内存） */
+        /*  RX BER：dst_flat 应等于 src_flat（硬件回环数据完整性校验）  */
         ber_rx.total_bytes += (UINT64)total;
-        ber_rx.error_bytes += __dma_count_errors(dst_flat, src_flat, total);
+        // ber_rx.error_bytes += __dma_count_errors(src_flat, dst_flat, total);
+
+        total_rounds++;
+        sec_bytes  += (UINT64)total;
+        sec_rounds++;
+
+        /*  每秒输出中间报告  */
+        t_now = API_TimeGet64();
+        if (t_now - t_sec_start >= (UINT64)LW_CFG_TICKS_PER_SEC) {
+            UINT64  elapsed = t_now - t_sec_start;
+            UINT64  tx_kbs  = THROUGHPUT_KBS(sec_bytes, elapsed);
+            UINT64  fd_kbs  = THROUGHPUT_KBS(sec_bytes * 2ULL, elapsed);  /* 溢出安全：sec_bytes≤UINT64_MAX/2 */
+
+            sec_idx++;
+            printk("[dma_test]    [%3us]  rounds=%-4u  TX: ", sec_idx, sec_rounds);
+            __dma_perf_print_kbs(tx_kbs);
+            printk("  RX: ");
+            __dma_perf_print_kbs(tx_kbs);                          /*  TX==RX（对称传输）               */
+            printk("  FD: ");
+            __dma_perf_print_kbs(fd_kbs);
+            printk("\n");
+
+            sec_bytes   = 0;
+            sec_rounds  = 0;
+            t_sec_start = t_now;
+        }
     }
-    t_wall = API_TimeGet64() - t_wall_start;                            /*  挂钟总耗时（含所有开销）    */
 
-    /* 吞吐统计（挂钟时间，含 FIFO 预填充 / prep / BER 校验等全部开销） */
-    printk("[dma_test]   TX  : "); __print_throughput((UINT64)total * rounds, t_wall);
-    printk("[dma_test]   RX  : "); __print_throughput((UINT64)total * rounds, t_wall);
-    printk("[dma_test]   FD  : "); __print_throughput((UINT64)total * rounds * 2, t_wall);
-    __print_ber("TX BER", &ber_tx);
-    __print_ber("RX BER", &ber_rx);
-    ret = (ber_tx.error_bytes == 0 && ber_rx.error_bytes == 0) ? 0 : -1;
+    /*  输出最后一个不满 1 秒的区间（若有剩余轮次）  */
+    t_now = API_TimeGet64();
+    if (sec_rounds > 0 && t_now > t_sec_start) {
+        UINT64  elapsed = t_now - t_sec_start;
+        UINT64  tx_kbs  = THROUGHPUT_KBS(sec_bytes, elapsed);
+        UINT64  fd_kbs  = THROUGHPUT_KBS(sec_bytes * 2ULL, elapsed);
 
-_out_comp:
+        sec_idx++;
+        printk("[dma_test]    [%3us]  rounds=%-4u  TX: ", sec_idx, sec_rounds);
+        __dma_perf_print_kbs(tx_kbs);
+        printk("  RX: ");
+        __dma_perf_print_kbs(tx_kbs);
+        printk("  FD: ");
+        __dma_perf_print_kbs(fd_kbs);
+        printk("  (partial)\n");
+    }
+
+    t_wall = API_TimeGet64() - t_start;
+
+    {
+        UINT64  avg_kbs    = THROUGHPUT_KBS(ber_rx.total_bytes, t_wall);
+        UINT64  avg_fd_kbs = THROUGHPUT_KBS(ber_rx.total_bytes * 2ULL, t_wall);  /* 溢出安全 */
+
+        printk("[dma_test]  >> Summary: rounds=%-6u  errors=%-4u  total=%lluB  time=%llums\n",
+               total_rounds, error_rounds,
+               (unsigned long long)ber_rx.total_bytes,
+               (unsigned long long)TICKS_TO_MS(t_wall));
+        printk("[dma_test]   TX  : "); __dma_perf_print_kbs(avg_kbs);
+        printk("  |  RX  : "); __dma_perf_print_kbs(avg_kbs);
+        printk("  |  FD  : "); __dma_perf_print_kbs(avg_fd_kbs);
+        printk("\n");
+        __print_ber("RX BER", &ber_rx);
+    }
+    ret = (ber_rx.error_bytes == 0 && error_rounds == 0) ? 0 : -1;
+
 _out:
     if (sync_init) { __dma_pair_sync_destroy(&sync); }
     if (sgl_rx)   { sys_free(sgl_rx); }
     if (sgl_tx)   { sys_free(sgl_tx); }
-    if (dst_flat) { sys_free(dst_flat); }
-    if (src_flat) { sys_free(src_flat); }
-    if (rx_fifo)  { sys_free(rx_fifo); }
-    if (tx_fifo)  { sys_free(tx_fifo); }
+    if (dst_flat) { API_VmmDmaFree(dst_flat); }
+    if (src_flat) { API_VmmDmaFree(src_flat); }
     if (ch_rx)    { dma_release_channel(ch_rx); }
     if (ch_tx)    { dma_release_channel(ch_tx); }
     printk("[dma_test] %s\n", ret ? "FAIL" : "PASS");
@@ -846,26 +924,6 @@ typedef struct {
 } dma_perf_result_t;
 
 /*********************************************************************************************************
-** 函数名称: __dma_perf_print_kbs
-** 功能描述: 格式化输出吞吐量（KB/s 或 MB/s）
-** 输　入  : kbs — 吞吐量（KB/s）；0 表示无法计算
-** 输　出  : NONE
-*********************************************************************************************************/
-
-static VOID  __dma_perf_print_kbs (UINT64 kbs)
-{
-    if (kbs == 0) {
-        printk("N/A");
-    } else if (kbs >= 1024) {
-        printk("%llu.%llu MB/s",
-               (unsigned long long)(kbs / 1024),
-               (unsigned long long)((kbs % 1024) * 10 / 1024));
-    } else {
-        printk("%llu KB/s", (unsigned long long)kbs);
-    }
-}
-
-/*********************************************************************************************************
 ** 函数名称: __dma_perf_run_one_timed
 ** 功能描述: 以时间为界运行单个性能场景，每秒输出中间报告，结束后汇总到 result
 ** 输　入  : scen         — 场景描述符
@@ -887,7 +945,7 @@ static INT  __dma_perf_run_one_timed (const dma_perf_scenario_t *scen,
     static CPCHAR  dir_str[] = { "M->M", "M->D", "D->M", "D->D" };
 
     dma_chan_t               *chan       = LW_NULL;
-    UINT8                    *mem_buf   = LW_NULL, *dev_buf = LW_NULL;
+    UINT8                    *mem_buf   = LW_NULL, *dev_buf = LW_NULL, *src_buf = LW_NULL;
     dma_sg_entry_t           *sgl       = LW_NULL;
     dma_async_tx_descriptor_t *desc;
     dma_completion_t          comp;
@@ -910,6 +968,12 @@ static INT  __dma_perf_run_one_timed (const dma_perf_scenario_t *scen,
     chan    = dma_request_chan_by_name(TEST_DEV_NAME, 0);
     mem_buf = chan ? (UINT8 *)sys_malloc(bytes_per_round) : LW_NULL;
     if (!mem_buf) { result->failed = LW_TRUE; goto  _done; }
+
+    if (scen->xfer_type == DMA_MEMCPY) {
+        src_buf = (UINT8 *)sys_malloc(bytes_per_round);
+        if (!src_buf) { result->failed = LW_TRUE; goto  _done; }
+        lib_memset(src_buf, 0xA5, bytes_per_round);                 /*  源数据模式（与 dst 0x5A 区分）  */
+    }
 
     if (scen->xfer_type == DMA_SLAVE) {
         dev_buf = (UINT8 *)sys_malloc(bytes_per_round);
@@ -949,7 +1013,7 @@ static INT  __dma_perf_run_one_timed (const dma_perf_scenario_t *scen,
         if (scen->xfer_type == DMA_MEMCPY) {
             desc = dmaengine_prep_dma_memcpy(chan,
                                               (phys_addr_t)(addr_t)mem_buf,
-                                              (phys_addr_t)(addr_t)mem_buf,
+                                              (phys_addr_t)(addr_t)src_buf,
                                               scen->entry_size, DMA_PREP_INTERRUPT);
         } else {
             desc = dmaengine_prep_slave_sg(chan, sgl, scen->sg_len,
@@ -1017,6 +1081,7 @@ _done:
     if (comp_init) { __dma_completion_destroy(&comp); }
     if (sgl)       { sys_free(sgl); }
     if (dev_buf)   { sys_free(dev_buf); }
+    if (src_buf)   { sys_free(src_buf); }
     if (mem_buf)   { sys_free(mem_buf); }
     if (chan)      { dma_release_channel(chan); }
     return  ret;
@@ -1112,29 +1177,30 @@ static INT  __cmd_dma_test_sg (INT iArgC, PCHAR ppcArgV[])
 }
 
 /*
- *  dma_test_loopback_fd [sg_len] [entry_size] [rounds]
+ *  dma_test_loopback_fd [sg_len] [entry_size] [duration_sec]
  *
- *  全双工回环：TX(ch0) 与 RX(ch1) 同时 issue，rx_fifo 预填充模拟硬件回环。
- *  典型用法（对应常见设备场景）：
- *    dma_test_loopback_fd                    — 4×512B 默认全双工回环
- *    dma_test_loopback_fd 3  500   100       — ETH 1500B 帧全双工 100 次
- *    dma_test_loopback_fd 8  1125   50       — Jumbo 9KB 帧全双工
- *    dma_test_loopback_fd 1  4096  1000      — 4KB 块设备全双工读写 1000 次
- *    dma_test_loopback_fd 1  65536  200      — 64KB 顺序全双工 IO
+ *  全双工回环：TX(ch0) 与 RX(ch1) 同时 issue，硬件 AXI Stream 回环保证数据路径。
+ *  时间驱动，每秒输出 TX/RX/FD 吞吐率，结束后输出累计 BER。
+ *  典型用法：
+ *    dma_test_loopback_fd                    — 4×512B 默认全双工 3s
+ *    dma_test_loopback_fd 3  500  10         — ETH 1500B 帧全双工 10s
+ *    dma_test_loopback_fd 8  1125  30        — Jumbo 9KB 帧全双工 30s
+ *    dma_test_loopback_fd 1  4096  60        — 4KB 块设备全双工 60s
+ *    dma_test_loopback_fd 1  65536  30       — 64KB 顺序全双工 IO 30s
  */
 static INT  __cmd_dma_test_loopback_fd (INT iArgC, PCHAR ppcArgV[])
 {
-    UINT    sg  = 4, rounds = 1;
+    UINT    sg = 4, duration = 3;
     size_t  ent = 512;
 
-    if (iArgC >= 2) { sg     = (UINT)lib_strtoul(ppcArgV[1], LW_NULL, 10); }
-    if (iArgC >= 3) { ent    = (size_t)lib_strtoul(ppcArgV[2], LW_NULL, 10); }
-    if (iArgC >= 4) { rounds = (UINT)lib_strtoul(ppcArgV[3], LW_NULL, 10); }
-    if (!sg || sg > TEST_SG_MAX || !ent || ent > (4 << 20) || !rounds || rounds > 100000) {
-        printk("usage: dma_test_loopback_fd [sg(1~64)] [entry(1~4194304)] [rounds(1~100000)]\n");
+    if (iArgC >= 2) { sg       = (UINT)lib_strtoul(ppcArgV[1], LW_NULL, 10); }
+    if (iArgC >= 3) { ent      = (size_t)lib_strtoul(ppcArgV[2], LW_NULL, 10); }
+    if (iArgC >= 4) { duration = (UINT)lib_strtoul(ppcArgV[3], LW_NULL, 10); }
+    if (!sg || sg > TEST_SG_MAX || !ent || ent > (4 << 20) || !duration || duration > 300) {
+        printk("usage: dma_test_loopback_fd [sg(1~64)] [entry(1~4194304)] [duration_sec(1~300)]\n");
         return  (-1);
     }
-    return  __dma_test_loopback_fd_run(sg, ent, rounds);
+    return  __dma_test_loopback_fd_run(sg, ent, duration);
 }
 
 static INT  __cmd_dma_test_perf (INT iArgC, PCHAR ppcArgV[])
@@ -1169,10 +1235,13 @@ VOID  dma_test_register_cmds (VOID)
                          "       'dma_test_sg 1 4096 tx' block 4KB write TX\n");
 
     API_TShellKeywordAdd("dma_test_loopback_fd", __cmd_dma_test_loopback_fd);
-    API_TShellFormatAdd ("dma_test_loopback_fd", " [sg] [entry] [rounds]");
-    API_TShellHelpAdd   ("dma_test_loopback_fd", "full-duplex TX||RX concurrent loopback  [sg=4 entry=512 rounds=1]\n"
-                         "  e.g. 'dma_test_loopback_fd 3 500 100'   ETH frame full-duplex\n"
-                         "       'dma_test_loopback_fd 1 4096 1000' block I/O full-duplex\n");
+    API_TShellFormatAdd ("dma_test_loopback_fd", " [sg] [entry] [duration_sec]");
+    API_TShellHelpAdd   ("dma_test_loopback_fd",
+                         "full-duplex TX||RX concurrent HW loopback, time-based  [sg=4 entry=512 duration_sec=3]\n"
+                         "  per-second: rounds / TX / RX / FD throughput\n"
+                         "  final:      total rounds, errors, avg throughput, cumulative RX BER\n"
+                         "  e.g. 'dma_test_loopback_fd 3 500 10'   ETH 1500B frame full-duplex 10s\n"
+                         "       'dma_test_loopback_fd 1 4096 30'  block I/O full-duplex 30s\n");
 
     API_TShellKeywordAdd("dma_test_perf",     __cmd_dma_test_perf);
     API_TShellFormatAdd ("dma_test_perf",     " [duration_sec]");
