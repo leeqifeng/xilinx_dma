@@ -135,6 +135,16 @@ struct dma_chan;
 struct dma_device;
 
 /*********************************************************************************************************
+  Cookie 辅助函数前置声明
+*********************************************************************************************************/
+static LW_INLINE VOID      dma_cookie_init     (dma_chan_t *chan);
+static LW_INLINE dma_cookie_t dma_cookie_assign (dma_async_tx_descriptor_t *tx);
+static LW_INLINE VOID      dma_cookie_complete (dma_async_tx_descriptor_t *tx);
+static LW_INLINE dma_status_t dma_cookie_status (dma_chan_t *chan,
+                                                   dma_cookie_t  cookie,
+                                                   dma_tx_state_t *state);
+
+/*********************************************************************************************************
   DMA 异步传输描述符
 **
 **  生命期：
@@ -245,42 +255,20 @@ typedef BOOL (*dma_filter_fn)(dma_chan_t *chan, PVOID filter_param);
 
 /*================================================ 框架公开 API ==========================================*/
 
-/*
- *  框架初始化 / 反初始化（在 module_init / module_exit 中调用）
- */
-INT   dma_engine_init  (VOID);
-VOID  dma_engine_exit  (VOID);
 
-/*
- *  DMA 控制器注册 / 注销（由硬件驱动调用）
- */
-INT   dma_async_device_register  (dma_device_t *device);
-VOID  dma_async_device_unregister(dma_device_t *device);
-
-/*
- *  通道申请（由使用者调用）
- *    dma_request_channel     : 按类型 + 过滤函数申请
- *    dma_request_chan_by_name: 按设备名 + 通道索引申请（推荐）
- */
-dma_chan_t *dma_request_channel     (dma_transaction_type_t type,
-                                      dma_filter_fn          filter,
-                                      PVOID                  filter_param);
-dma_chan_t *dma_request_chan_by_name (CPCHAR dev_name, UINT idx);
-VOID        dma_release_channel      (dma_chan_t *chan);
-
-/*
- *  事务提交与触发
- */
-dma_cookie_t  dmaengine_submit       (dma_async_tx_descriptor_t *desc);
-VOID          dma_async_issue_pending(dma_chan_t *chan);
-
-/*
- *  状态查询
- */
-dma_status_t  dmaengine_tx_status(dma_chan_t *chan,
-                                    dma_cookie_t cookie,
-                                    dma_tx_state_t *state);
-dma_status_t  dma_sync_wait      (dma_chan_t *chan, dma_cookie_t cookie);
+INT   dma_engine_init(VOID);                                            /*  初始化 DMA Engine         */
+VOID  dma_engine_exit(VOID);                                            /*  反初始化 DMA Engine 框架   */
+INT   dma_async_device_register(dma_device_t *device);                  /*  控制器注册        */
+VOID  dma_async_device_unregister(dma_device_t *device);                /*  控制器注销        */
+dma_chan_t *dma_request_channel(dma_transaction_type_t type, dma_filter_fn filter,
+                                PVOID filter_param);                    /*  按能力进行通道申请          */
+dma_chan_t *dma_request_chan_by_name (CPCHAR dev_name, UINT idx);       /*  按名称进行通道申请          */
+VOID        dma_release_channel      (dma_chan_t *chan);                /*  释放已申请的 DMA 通道       */
+dma_cookie_t  dmaengine_submit       (dma_async_tx_descriptor_t *desc); /*  提交准备好的描述符给发送队列 */
+VOID          dma_async_issue_pending(dma_chan_t *chan);                /*  通知框架开始处理队列里的事务 */
+dma_status_t  dmaengine_tx_status(dma_chan_t *chan, dma_cookie_t cookie,
+                                  dma_tx_state_t *state);               /*  查询 cookie 对应传输状态   */
+dma_status_t  dma_sync_wait(dma_chan_t *chan, dma_cookie_t cookie);     /*  同步等待传输完成           */
 
 /*================================================ 框架 thin-wrapper inline =============================*/
 
@@ -330,19 +318,26 @@ dmaengine_terminate_all (dma_chan_t *chan)
 
 /*================================================ Cookie 辅助（供驱动使用）==============================*/
 
-/*
- *  初始化通道 cookie 计数
- */
+/*********************************************************************************************************
+** 函数名称: dma_cookie_init
+** 功能描述: 初始化通道 cookie 计数（在通道资源分配时调用一次）
+** 输　入  : chan — 目标通道
+** 输　出  : NONE
+** 备　注  : 初始化后 chan->cookie = DMA_MIN_COOKIE, completed_cookie = DMA_MIN_COOKIE - 1
+*********************************************************************************************************/
 static LW_INLINE VOID  dma_cookie_init (dma_chan_t *chan)
 {
     chan->cookie           = DMA_MIN_COOKIE;
     chan->completed_cookie = DMA_MIN_COOKIE - 1;
 }
 
-/*
- *  为描述符分配下一个 cookie，并更新通道 cookie 计数
- *  需在驱动 tx_submit 中的自旋锁保护下调用
- */
+/*********************************************************************************************************
+** 函数名称: dma_cookie_assign
+** 功能描述: 为描述符分配下一个 cookie，并更新通道 cookie 计数
+** 输　入  : tx — 已绑定 chan 的描述符（tx->chan 必须非空）
+** 输　出  : 分配的 cookie（正数）
+** 备　注  : 需在驱动 tx_submit 的自旋锁保护下调用；cookie 绕回时重置为 DMA_MIN_COOKIE
+*********************************************************************************************************/
 static LW_INLINE dma_cookie_t  dma_cookie_assign (dma_async_tx_descriptor_t *tx)
 {
     dma_chan_t   *chan   = tx->chan;
@@ -356,10 +351,14 @@ static LW_INLINE dma_cookie_t  dma_cookie_assign (dma_async_tx_descriptor_t *tx)
     return  cookie;
 }
 
-/*
- *  标记描述符对应的传输已完成
- *  需在传输完成处理中调用（通常在驱动 worker 线程中）
- */
+/*********************************************************************************************************
+** 函数名称: dma_cookie_complete
+** 功能描述: 标记描述符对应的传输已完成（更新通道 completed_cookie）
+** 输　入  : tx — 已完成的描述符
+** 输　出  : NONE
+** 备　注  : 内部执行 completed_cookie = max(completed_cookie, tx->cookie)；
+**           需在传输完成处理（通常为 ISR 底半部）中调用
+*********************************************************************************************************/
 static LW_INLINE VOID  dma_cookie_complete (dma_async_tx_descriptor_t *tx)
 {
     if (tx->chan->completed_cookie < tx->cookie) {
@@ -367,10 +366,16 @@ static LW_INLINE VOID  dma_cookie_complete (dma_async_tx_descriptor_t *tx)
     }
 }
 
-/*
- *  根据 cookie 查询传输状态
- *  驱动在 device_tx_status 实现中调用
- */
+/*********************************************************************************************************
+** 函数名称: dma_cookie_status
+** 功能描述: 根据 cookie 查询传输状态
+** 输　入  : chan   — 目标通道
+**           cookie — 要查询的 cookie
+**           state  — 输出状态（可为 LW_NULL）
+** 输　出  : DMA_COMPLETE / DMA_IN_PROGRESS / DMA_ERROR
+** 备　注  : completed >= cookie → COMPLETE；cookie <= used 且 completed < cookie → IN_PROGRESS；
+**           cookie > used → ERROR；驱动在 device_tx_status 实现中调用
+*********************************************************************************************************/
 static LW_INLINE dma_status_t
 dma_cookie_status (dma_chan_t *chan, dma_cookie_t cookie, dma_tx_state_t *state)
 {

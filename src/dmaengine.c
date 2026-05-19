@@ -144,7 +144,6 @@ VOID  dma_async_device_unregister (dma_device_t *device)
 ** 输　出  : 成功返回通道指针；失败返回 LW_NULL
 ** 说明    : 遍历全局设备链表，对每个通道调用 filter；找到第一个匹配的通道后，
 **           调用 device_alloc_chan_resources 初始化该通道并返回。
-**           本实现不追踪通道占用状态，由驱动的 alloc_chan_resources 保证幂等性。
 *********************************************************************************************************/
 
 dma_chan_t  *dma_request_channel (dma_transaction_type_t   type,
@@ -193,7 +192,7 @@ dma_chan_t  *dma_request_channel (dma_transaction_type_t   type,
 
 /*********************************************************************************************************
 ** 函数名称: dma_request_chan_by_name
-** 功能描述: 按设备名 + 通道索引申请 DMA 通道（嵌入式场景推荐用法）
+** 功能描述: 按设备名 + 通道索引申请 DMA 通道
 ** 输　入  : dev_name — 控制器名称（与 dma_device_t.dev_name 匹配）
 **           idx      — 通道索引（0-based）
 ** 输　出  : 成功返回通道指针；失败返回 LW_NULL
